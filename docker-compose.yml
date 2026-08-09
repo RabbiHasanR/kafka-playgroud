@@ -1,0 +1,60 @@
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"   # host clients (python, etc.)
+    environment:
+      # --- KRaft: this node is both controller and broker (no ZooKeeper) ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Listeners ---
+      # INTERNAL  -> other containers reach the broker at kafka:19092
+      # EXTERNAL  -> your host reaches the broker at localhost:9092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # --- Single-broker musts: internal topics can't replicate beyond 1 ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
+
+      # --- Learning-friendly tweaks ---
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # force explicit topic creation
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # groups form instantly
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: kafka-playground-cluster-01
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: playground
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka-data:
