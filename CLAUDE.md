@@ -70,6 +70,18 @@ quietly keeping it.
 - No hardcoded secrets or connection strings — environment variables only.
 - Conventional commits (`feat/fix/refactor/test/chore/docs/ci`).
 
+## Git
+
+**Commit to `master`. Never create a branch unless I explicitly ask for one.**
+
+This overrides any general "don't commit to the default branch" convention. This is
+a solo learning repository with no remote and no reviewers — branches add ceremony
+without adding safety, and they fragment the history that the spec gates already
+structure.
+
+Do not create, switch to, or merge branches on your own initiative. If a change
+seems risky enough to want isolation, say so and ask.
+
 ## Infrastructure
 
 The broker is defined in `docker-compose.yml` (single-node KRaft, Kafka 4.3.1).
