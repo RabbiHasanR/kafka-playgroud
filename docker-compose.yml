@@ -56,5 +56,41 @@ services:
       kafka:
         condition: service_healthy
 
+  # --- spec 001: order-event pipeline -------------------------------------
+  # Both services share one image and differ only in their command. They reach
+  # the broker on the INTERNAL listener (kafka:19092), never localhost:9092 —
+  # that address only resolves from the host.
+
+  producer:
+    build: .
+    container_name: order-producer
+    command: python -m order_pipeline.producer.app
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_EVENTS_TOPIC: order-events
+      PRODUCER_HOST: 0.0.0.0
+      PRODUCER_PORT: 8000
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  consumer:
+    build: .
+    container_name: order-consumer
+    command: python -m order_pipeline.consumer.main
+    ports:
+      - "8001:8001"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_EVENTS_TOPIC: order-events
+      CONSUMER_GROUP_ID: order-processor
+      CONSUMER_STATE_HOST: 0.0.0.0
+      CONSUMER_STATE_PORT: 8001
+    depends_on:
+      kafka:
+        condition: service_healthy
+
 volumes:
   kafka-data:
