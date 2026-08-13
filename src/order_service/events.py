@@ -2,9 +2,9 @@
 
 This is the only module every side imports. Keeping the schema and the lifecycle
 transition table in one place means what is produced and what is validated cannot
-drift apart — the same reasoning as 001's D10, applied to four services instead of two.
+drift apart across the four processes that share it.
 
-Two things differ from 001's contract and both are deliberate.
+Two properties of this contract are deliberate and worth reading twice.
 
 **There is no ``PAID`` event (D3).** This is a *prepaid* flow: payment settles before
 the order exists, so it is a field on ``ORDER_CREATED`` rather than a step in the
@@ -12,9 +12,9 @@ chain. The lifecycle is ``CREATED → PACKED → SHIPPED → DELIVERED``.
 
 **A wrong total cannot be represented.** :class:`OrderCreatedPayload` rejects a
 ``total_amount`` that disagrees with the items or with the payment, so the check
-happens at the API boundary and the bad event never exists. 001 detects the same error
-on the consumer, after the fact. Moving it here fixes it once for every consumer
-instead of once per consumer — which is the point, since there are three of them.
+happens at the API boundary and the bad event never exists. The alternative — publish
+it and let each consumer fold the items and compare — fixes nothing once, and has to be
+got right in every consumer separately. There are three of them here.
 
 Money is carried as **integer minor units** (paisa/cents), never floats, so the
 equality checks above have exactly one possible cause of failure.
@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class EventType(StrEnum):
-    """The four order lifecycle event types (R2.2)."""
+    """The four order lifecycle event types (R1.2)."""
 
     ORDER_CREATED = "ORDER_CREATED"
     PACKED = "PACKED"
@@ -59,12 +59,11 @@ class PaymentMethod(StrEnum):
     NAGAD = "NAGAD"
 
 
-#: The one legal predecessor state per event type (R2.5).
+#: The one legal predecessor state per event type (R1.5).
 #:
 #: ``None`` means "the order does not exist yet", so ``ORDER_CREATED`` is the only
-#: event that may legally arrive for an unknown order. Unlike 001 this is a single
-#: value rather than a set: the prepaid chain is strictly linear, with no repeatable
-#: step.
+#: event that may legally arrive for an unknown order. A single value rather than a
+#: set, because the prepaid chain is strictly linear with no repeatable step.
 LEGAL_PREDECESSOR: dict[EventType, OrderState | None] = {
     EventType.ORDER_CREATED: None,
     EventType.PACKED: OrderState.CREATED,
@@ -90,7 +89,7 @@ EXPECTED_NEXT_EVENT: dict[OrderState | None, EventType] = {
 
 
 class OrderItem(BaseModel):
-    """One line item of an order (R2.6).
+    """One line item of an order (R1.6).
 
     Attributes:
         sku: Stock-keeping unit of the line item.
@@ -113,7 +112,7 @@ class OrderItem(BaseModel):
 
 
 class PaymentInfo(BaseModel):
-    """A settled payment carried on an ``ORDER_CREATED`` event (R2.6).
+    """A settled payment carried on an ``ORDER_CREATED`` event (R1.6).
 
     Attributes:
         method: How the customer paid.
@@ -127,7 +126,7 @@ class PaymentInfo(BaseModel):
 
 
 class OrderCreatedPayload(BaseModel):
-    """Payload of an ``ORDER_CREATED`` event (R2.6).
+    """Payload of an ``ORDER_CREATED`` event (R1.6).
 
     Attributes:
         customer_id: Who placed the order.
@@ -143,11 +142,10 @@ class OrderCreatedPayload(BaseModel):
 
     @model_validator(mode="after")
     def _validate_totals(self) -> "OrderCreatedPayload":
-        """Check the total against the items and against the payment (R2.14).
+        """Check the total against the items and against the payment (R1.14).
 
-        This is the check 001 performs on the consumer. Doing it here means a
-        disagreeing total is a rejected request rather than a published event that
-        every downstream service has to notice independently.
+        Doing it here means a disagreeing total is a rejected request rather than a
+        published event that every downstream service has to notice independently.
 
         Returns:
             The validated payload.
@@ -170,7 +168,7 @@ class OrderCreatedPayload(BaseModel):
 
 
 class ShippedPayload(BaseModel):
-    """Payload of a ``SHIPPED`` event (R2.7).
+    """Payload of a ``SHIPPED`` event (R1.7).
 
     Attributes:
         carrier: Who is carrying the parcel.
@@ -199,7 +197,7 @@ def utc_now() -> datetime:
 
 
 def new_event_id() -> str:
-    """Return a fresh globally unique event identifier (R2.4).
+    """Return a fresh globally unique event identifier (R1.4).
 
     Returns:
         A UUID4 string.
@@ -231,16 +229,16 @@ def validate_payload(event_type: EventType, payload: dict[str, Any]) -> BaseMode
 
 
 class LifecycleEvent(BaseModel):
-    """A single order lifecycle event (R2.1).
+    """A single order lifecycle event (R1.1).
 
     Attributes:
         event_id: Globally unique identity of this event. Nothing reads it yet; it is
-            the natural deduplication key once 004 and 009 make duplicates matter, and
+            the natural deduplication key once 003 and 008 make duplicates matter, and
             a stable handle in logs before then (D11).
         order_id: Identity of the order. Also the Kafka message key, which is what
-            routes all of an order's events to one partition (R2.10).
+            routes all of an order's events to one partition (R1.10).
         sequence: Position of this event within its order, starting at 1 and
-            increasing by exactly 1 (R2.3).
+            increasing by exactly 1 (R1.3).
         event_type: Which lifecycle event this is.
         occurred_at: When the order service emitted the event.
         payload: Event-type-specific data, validated against :data:`PAYLOAD_MODELS`.

@@ -56,47 +56,15 @@ services:
       kafka:
         condition: service_healthy
 
-  # --- spec 001: order-event pipeline -------------------------------------
-  # Both services share one image and differ only in their command. They reach
-  # the broker on the INTERNAL listener (kafka:19092), never localhost:9092 —
-  # that address only resolves from the host.
-
-  producer:
-    build: .
-    container_name: order-producer
-    command: python -m order_pipeline.producer.app
-    ports:
-      - "8000:8000"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
-      ORDER_EVENTS_TOPIC: order-events
-      PRODUCER_HOST: 0.0.0.0
-      PRODUCER_PORT: 8000
-    depends_on:
-      kafka:
-        condition: service_healthy
-
-  consumer:
-    build: .
-    container_name: order-consumer
-    command: python -m order_pipeline.consumer.main
-    ports:
-      - "8001:8001"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
-      ORDER_EVENTS_TOPIC: order-events
-      CONSUMER_GROUP_ID: order-processor
-      CONSUMER_STATE_HOST: 0.0.0.0
-      CONSUMER_STATE_PORT: 8001
-    depends_on:
-      kafka:
-        condition: service_healthy
-
-  # --- spec 002: prepaid order service + consumer fan-out -----------------
-  # One image, four commands. The three consumers subscribe to the SAME topic
-  # with THREE DIFFERENT group ids — that is the fan-out: each one receives
-  # every event and keeps its own offset. Spec 003 does the opposite, adding a
-  # second consumer to one group so the messages divide instead.
+  # --- spec 001: prepaid order service + consumer fan-out -----------------
+  # One image, four commands. They reach the broker on the INTERNAL listener
+  # (kafka:19092), never localhost:9092 — that address only resolves from the
+  # host.
+  #
+  # The three consumers subscribe to the SAME topic with THREE DIFFERENT group
+  # ids — that is the fan-out: each one receives every event and keeps its own
+  # offset. Spec 002 does the opposite, adding a second consumer to one group
+  # so the messages divide instead.
 
   order-service:
     build: .

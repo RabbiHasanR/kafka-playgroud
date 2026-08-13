@@ -1,15 +1,13 @@
-# The order flow (spec 002)
+# The order flow (spec 001)
 
 What this project's order service actually does, end to end.
 
-## The one-line difference between 001 and 002
+**In one line:** a prepaid order is placed in a single HTTP call, and three independent
+services react to the resulting event without knowing about one another.
 
-**001 shows how Kafka orders messages. 002 shows how services are wired around it.**
-
-001 is a mechanics lab: its producer publishes any event type you name, for any order,
-and has flags that deliberately corrupt ordering. That is right for studying keys,
-partitions, offsets and lag — and wrong as a picture of a real service. 002 is the same
-mechanics in a realistic shape.
+The order domain is a familiar backdrop; what is actually being studied is Kafka — that
+the message key pins an order's events to one partition and keeps them ordered, and
+that three consumer groups on one topic each get every message.
 
 ## Synchronous vs. asynchronous
 
@@ -47,7 +45,7 @@ goes on a topic instead of into three HTTP calls.
 Each service joins its **own consumer group**, so Kafka keeps three independent offsets
 and every service sees every message.
 
-| | Fan-out (002) | Scale-out (003) |
+| | Fan-out (001, here) | Scale-out (002, next) |
 |---|---|---|
 | Setup | 3 consumers, 3 groups | 3 consumers, 1 group |
 | Who gets a message | all of them | exactly one of them |
@@ -77,8 +75,8 @@ CREATED ──PACKED──► PACKED ──SHIPPED──► SHIPPED ──DELIVE
 ```
 
 The **order service owns this chain**. Asking it to publish `SHIPPED` for an order that
-was never packed gets a `409`, and nothing reaches the topic. This is the sharpest
-difference from 001, whose equivalent endpoint publishes whatever it is handed.
+was never packed gets a `409`, and nothing reaches the topic — a real service refuses a
+transition its aggregate cannot make, rather than publishing whatever it is handed.
 
 `force: true` bypasses that guard. It exists so the consumers' detection is reachable —
 a service that never emits an illegal transition gives them nothing to detect. A forced
@@ -189,8 +187,8 @@ docker compose start notification-consumer   # catches up from its own offset
 |---|---|
 | A database | Orders live in memory; restarting the service forgets them |
 | A transactional outbox | Without a DB there is no dual write to solve — the production fix is to write the event to an `outbox` table in the same transaction as the order, and relay it |
-| Deduplication | Delivery is at-least-once. Every event carries an `event_id` for the day it matters (specs 004, 009) |
-| Bulk generation | Load, lag and throughput experiments live in spec 001 |
+| Deduplication | Delivery is at-least-once. Every event carries an `event_id` for the day it matters (specs 003, 008) |
+| Bulk generation | No load generator, so no lag or throughput experiment yet |
 | A real payment gateway | Payment is already settled when the order arrives; the webhook-driven variant is a different flow |
 
-Full criteria in [`specs/002-prepaid-order-service/`](../specs/002-prepaid-order-service/requirements.md).
+Full criteria in [`specs/001-prepaid-order-service/`](../specs/001-prepaid-order-service/requirements.md).

@@ -1,15 +1,14 @@
 """The order aggregate: identity, sequence allocation, and the transition guard.
 
-This module is the sharpest difference between 001 and 002. 001's producer publishes
-whatever event type the caller names, because it has no notion of an order. This one
-owns the order, so it can refuse: publishing ``SHIPPED`` for an order that was never
-packed is a ``409``, not a message on a topic (R2.21, D4).
+This module is what makes the HTTP surface a service rather than a publish fixture.
+It owns the order, so it can refuse: publishing ``SHIPPED`` for an order that was never
+packed is a ``409``, not a message on a topic (R1.21, D4).
 
 **The escape hatch is deliberate.** That guard would make the consumers' detection
 unreachable — a service that never emits an illegal transition gives them nothing to
 detect. So :meth:`OrderStore.reserve` takes ``force``, defaulted off, which bypasses
 the successor check. Default behaviour is what production does; the flag is the lab
-lever, exactly as 001 does with ``unkeyed`` and ``shuffle``.
+lever, and it defaults off.
 
 **A forced event does not advance the recorded state.** The guard rejected the
 transition precisely because the aggregate cannot make it; recording it anyway would
@@ -18,7 +17,7 @@ state does not.
 
 **Sequences are spent, not reserved.** :meth:`reserve` increments under the lock and
 does not roll back if the publish then fails. That is honest — the number was spent
-whether or not the broker took the message — and it is the same behaviour as 001's D8.
+whether or not the broker took the message.
 """
 
 import threading
@@ -38,11 +37,11 @@ from order_service.events import (
 
 
 class UnknownOrder(Exception):
-    """No order with the given id exists (R2.20)."""
+    """No order with the given id exists (R1.20)."""
 
 
 class IllegalTransition(Exception):
-    """The requested event is not the legal successor of the order's state (R2.21).
+    """The requested event is not the legal successor of the order's state (R1.21).
 
     Attributes:
         order_id: The order the request was for.
@@ -83,7 +82,7 @@ class IllegalTransition(Exception):
 
 @dataclass(frozen=True)
 class Order:
-    """The order service's own record of one order (R2.13).
+    """The order service's own record of one order (R1.13).
 
     Attributes:
         order_id: Identity of the order, and the Kafka message key for its events.
@@ -104,7 +103,7 @@ class Order:
     last_sequence: int
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-serialisable view of this order (R2.27).
+        """Return a JSON-serialisable view of this order (R1.27).
 
         Returns:
             The order's fields, with enums rendered as plain strings.
@@ -143,10 +142,10 @@ class OrderStore:
     """In-memory store of every order this process has created.
 
     **This deliberately has no persistence.** Restarting the service forgets every
-    order, so advancing a pre-restart order returns `404`. That is the same class of
-    limitation as 001's D8 and is not to be "fixed" here: a real service holds orders
-    in a database and publishes through a transactional outbox, so that the row and
-    the event cannot diverge. Neither is in scope for this feature.
+    order, so advancing a pre-restart order returns `404`. Not to be "fixed" here: a
+    real service holds orders in a database and publishes through a transactional
+    outbox, so that the row and the event cannot diverge. Neither is in scope for this
+    feature.
     """
 
     def __init__(self) -> None:
@@ -157,7 +156,7 @@ class OrderStore:
         self._lock = threading.Lock()
 
     def register(self, order_id: str, payload: OrderCreatedPayload) -> Order:
-        """Record a newly created order at sequence 1 (R2.13).
+        """Record a newly created order at sequence 1 (R1.13).
 
         Called *after* the ``ORDER_CREATED`` event has been acknowledged, so a broker
         failure leaves no order behind rather than an order nobody downstream knows
@@ -198,7 +197,7 @@ class OrderStore:
     def reserve(
         self, order_id: str, event_type: EventType, *, force: bool = False
     ) -> int:
-        """Check the transition and allocate the next sequence (R2.3, R2.21, R2.26).
+        """Check the transition and allocate the next sequence (R1.3, R1.21, R1.26).
 
         The check and the allocation happen under one lock, so two concurrent requests
         cannot both be told they hold sequence *n*.
@@ -211,7 +210,7 @@ class OrderStore:
         Args:
             order_id: The order to advance.
             event_type: The event type the caller wants to publish.
-            force: When ``True``, bypass the successor check (R2.24).
+            force: When ``True``, bypass the successor check (R1.24).
 
         Returns:
             The sequence number allocated to the event.
@@ -239,7 +238,7 @@ class OrderStore:
     def commit(
         self, order_id: str, event_type: EventType, *, force: bool = False
     ) -> Order:
-        """Advance the order's recorded state after a successful publish (R2.23).
+        """Advance the order's recorded state after a successful publish (R1.23).
 
         A forced publish leaves the state untouched — see the module docstring.
 

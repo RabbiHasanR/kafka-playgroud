@@ -1,6 +1,6 @@
 """The notification service.
 
-Reacts to all four event types (R2.34) with a different customer-facing message each
+Reacts to all four event types (R1.34) with a different customer-facing message each
 time. One handler serves every type, with the wording chosen from a table — four
 near-identical handler functions would be four places to fix a typo.
 """

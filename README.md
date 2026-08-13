@@ -169,153 +169,9 @@ old values disappear. A key with a `null` value is a tombstone — it deletes th
   Reset the offsets or use a new `--group` name.
 - **`docker compose down -v` deletes the volume** and every message with it.
 
-
-
-
-
-
-
-
-
-
-
 ---
 
-# Spec 001 — Ordered Order-Event Pipeline
-
-A FastAPI producer publishes order lifecycle events to `order-events` (3 partitions,
-keyed by `order_id`); a single consumer folds them into per-order state and reports
-every ordering violation it finds. Full spec in
-[specs/001-order-event-pipeline/](specs/001-order-event-pipeline/).
-
-The pipeline detects broken ordering three independent ways:
-
-| Signal | Fires when | Why it exists |
-|---|---|---|
-| `SEQUENCE_GAP` | `sequence != last + 1` | mechanical — no domain knowledge needed |
-| `ILLEGAL_TRANSITION` | e.g. `SHIPPED` before `PACKED` | domain-level and intuitive |
-| `TOTAL_MISMATCH` | folded item total ≠ `PAID` amount | a true accumulator — **cannot** be computed from one message |
-
-The third is the one that settles the argument. Sequence numbers are
-self-*describing* but not self-*validating*: `seq: 4` is only wrong relative to a
-remembered `3`. A running total has no such ambiguity — with no prior state there is
-no total at all.
-
-## Running it
-
-Install (Python 3.11+):
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -e .
-```
-
-Start the broker and create the topic — auto-creation is off, so this is required:
-
-```bash
-docker compose up -d kafka
-./scripts/create_topics.sh
-```
-
-From the host, in two terminals:
-
-```bash
-.venv/bin/python -m order_pipeline.producer.app     # :8000
-.venv/bin/python -m order_pipeline.consumer.main    # :8001
-```
-
-Or inside compose, where the only thing that changes is the broker address
-(`kafka:19092` instead of `localhost:9092`):
-
-```bash
-docker compose up -d --build producer consumer
-```
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /orders/{order_id}/events` | publish one event; returns the **real** partition and offset |
-| `POST /simulate` | generate N lifecycles at a given rate; returns a job id |
-| `GET /simulate/{job_id}` | published / failed counts for a run |
-| `GET /state` (port 8001) | the consumer's folded state — the amnesia experiment reads this |
-
-Watching for violations is one filter:
-
-```bash
-grep VIOLATION consumer.log          # host
-docker compose logs consumer | grep VIOLATION
-```
-
-## The experiments
-
-Each one is a task in [tasks.md](specs/001-order-event-pipeline/tasks.md). Results
-below are from an actual run, not predictions.
-
-**T23 — the key decides the partition.** 20 orders, 160 events → 40/64/56 across the
-three partitions, and **zero** orders spanning more than one. Uneven by design: that
-is murmur2 hashing, not a bug.
-
-**T24 — happy path.** 50 orders, 400/400 published, zero violations, every total
-matching at `PAID`.
-
-**T25 — unkeyed.** 140 violations of all three types. Two surprises worth knowing:
-
-- Null-key messages do **not** automatically scatter. librdkafka's
-  `sticky.partitioning.linger.ms` (default 10 ms) keeps a burst of them on one
-  partition for batching, which silently keeps an unkeyed order ordered. The producer
-  sets it to `0` so the fault injection actually injects a fault.
-- Even scattered, a consumer that **keeps up in real time** may still see events in
-  the right order and report nothing. The violations appear once the consumer is
-  behind and drains each partition in batches. *Losing the guarantee is not the same
-  as losing the ordering* — which is exactly why this class of bug reaches production.
-
-**T26 — shuffled but correctly keyed.** All 8 events of an order on one partition,
-144 violations anyway. Kafka preserved the order it was given, including a wrong one.
-Partition ordering is faithful, not corrective.
-
-**T27 — no global ordering.** Timestamps are monotonic *within* every partition and
-non-monotonic across the topic. That is the guarantee boundary, working as designed.
-
-**T28 — offsets survive.** Killed the consumer, restarted it: resumed at the committed
-offsets (242/321/441) and re-consumed **0** records. Kafka remembered the position.
-
-**T29 — state does not survive.** Same restart, and all 90 orders of folded state were
-gone. An order with 3 items totalling 850 came back as `item_count: 0, total: 0`, and
-the next `PAID` event raised three violations — every one of them false. Nothing was
-wrong with the data.
-
-This is the point of the whole feature: **a committed offset is a position, not a
-memory.** And note the consumer cannot tell its own amnesia from a real producer bug —
-that ambiguity is why durable state matters, and spec 004 fixes it.
-
-**T30 — replay from zero.** A fresh `CONSUMER_GROUP_ID` re-read all 1320 records from
-earliest and the totals came back correct. This genuinely works, and it breaks for
-exactly two reasons: startup cost grows with the topic, and `retention.ms` eventually
-deletes the inputs you would need to re-fold. Hence compaction (007) and durable
-state (004).
-
-**T31 / T32 — failing loudly.** Producing to a missing topic gives a named error, not
-silent auto-creation. With the broker stopped the endpoint returns `504` and reports
-no partition or offset — and is careful *not* to blame a missing topic for what is
-really an unreachable broker.
-
-**T33 — lag.** A 16,000-event burst pushed lag to 12,911 before draining to zero.
-Visible in `kafka-consumer-groups.sh --describe` and in Kafka UI at `localhost:8080`.
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| Folded state lost on consumer restart (R1.27) | 004 |
-| Producer sequence counters lost on restart | accepted |
-| Duplicate processing after a crash (at-least-once) | 004, 009 |
-| Single broker, RF 1, no failover | 005 |
-
-Do not "fix" the first one inside 001 — it is the evidence that motivates 004.
-
----
-
-# Spec 002 — Prepaid Order Service
-
-**001 shows how Kafka orders messages. 002 shows how services are wired around it.**
+# Spec 001 — Prepaid Order Service
 
 A prepaid order is placed in one HTTP call; the service records it and publishes
 `ORDER_CREATED` to `order-lifecycle` (3 partitions, keyed by `order_id`). Three
@@ -325,22 +181,25 @@ consumer group**, so all three see every message. The order is then advanced thr
 
 Read [docs/order-flow.md](docs/order-flow.md) first — it is one page and covers the
 whole flow with runnable commands. Full spec in
-[specs/002-prepaid-order-service/](specs/002-prepaid-order-service/requirements.md).
+[specs/001-prepaid-order-service/](specs/001-prepaid-order-service/requirements.md).
 
-Two things it adds that 001 cannot show:
+Three things it demonstrates:
 
+- **Key → partition.** Every event is keyed by `order_id`, so one order's events land
+  on one partition and stay ordered. Different orders have no ordering guarantee
+  between them, and that is correct rather than a limitation.
+- **Fan-out by consumer group.** One topic, three group ids, three independent
+  offsets. Spec 002 does the opposite — extra consumers in *one* group, where the
+  messages divide instead of duplicating.
 - **The synchronous/asynchronous boundary.** `POST /orders` blocks because the caller
   needs an `order_id` back. Everything downstream of the event does not, and happens
   off the log.
-- **Fan-out by consumer group.** One topic, three group ids, three independent
-  offsets. Spec 003 does the opposite — extra consumers in *one* group, where the
-  messages divide instead of duplicating.
 
 ## Running it
 
 ```bash
-docker compose up -d --build            # broker + 001 + 002
-./scripts/create_topics.sh              # creates order-events AND order-lifecycle
+docker compose up -d --build            # broker, UI, order service, 3 consumers
+./scripts/create_topics.sh              # creates order-lifecycle (auto-create is off)
 docker compose logs -f inventory-consumer notification-consumer analytics-consumer
 ```
 
@@ -370,6 +229,6 @@ and put a genuinely out-of-order event on the log; all three services will repor
 |---|---|
 | Orders held in memory — a restart forgets them | accepted (a real service uses a database) |
 | No transactional outbox, so the record and the event cannot be atomic | out of scope; explained in the flow doc |
-| Consumer fold state lost on restart | 004 |
-| Duplicate processing after a crash (at-least-once) | 004, 009 |
-| No deduplication, though every event carries an `event_id` | 004, 009 |
+| Consumer fold state lost on restart | 003 |
+| Duplicate processing after a crash (at-least-once) | 003, 008 |
+| No deduplication, though every event carries an `event_id` | 003, 008 |

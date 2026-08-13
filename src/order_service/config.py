@@ -2,10 +2,10 @@
 
 Nothing here carries a hardcoded connection string. The only difference between
 running on the host and running inside the compose network is the value of
-``KAFKA_BOOTSTRAP_SERVERS`` (R2.44).
+``KAFKA_BOOTSTRAP_SERVERS`` (R1.44).
 
 ``SERVICE_NAME`` is what makes one image and one entry point serve three consumers
-(R2.37, D12): it selects an entry from the registry in
+(R1.37, D12): it selects an entry from the registry in
 :mod:`order_service.consumer.main`. ``CONSUMER_GROUP_ID`` is left unset by default and
 derived from the service name, so pointing a service at a fresh group — and thereby
 replaying the topic from the beginning — is a one-variable change.
@@ -22,8 +22,7 @@ class Settings(BaseSettings):
     Attributes:
         kafka_bootstrap_servers: Broker address. ``localhost:9092`` from the host,
             ``kafka:19092`` from inside the compose network.
-        order_lifecycle_topic: Topic carrying 002's lifecycle events. Distinct from
-            001's ``order-events`` so the two features cannot interfere (R2.9).
+        order_lifecycle_topic: Topic carrying the order lifecycle events (R1.9).
         service_name: Which consumer service this process runs as.
         consumer_group_id: Consumer group identity. When unset it is derived from
             ``service_name``; set it to an unused value to replay from earliest.

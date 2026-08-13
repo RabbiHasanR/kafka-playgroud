@@ -50,14 +50,14 @@ router = APIRouter()
 
 
 class CreateOrderRequest(BaseModel):
-    """Body of a prepaid order creation (R2.12).
+    """Body of a prepaid order creation (R1.12).
 
     Attributes:
         customer_id: Who is placing the order.
         items: The line items; at least one is required.
         payment: The payment that has already settled. Its amount must equal
             ``Σ(qty × unit_price)`` — a disagreement is rejected before any event is
-            published (R2.14).
+            published (R1.14).
     """
 
     customer_id: str = Field(min_length=1)
@@ -66,7 +66,7 @@ class CreateOrderRequest(BaseModel):
 
 
 class CreateOrderResponse(BaseModel):
-    """What the caller gets back from a successful creation (R2.17).
+    """What the caller gets back from a successful creation (R1.17).
 
     Attributes:
         order_id: Identity assigned to the new order.
@@ -86,12 +86,12 @@ class CreateOrderResponse(BaseModel):
 
 
 class PublishEventRequest(BaseModel):
-    """Body of a lifecycle advance (R2.19).
+    """Body of a lifecycle advance (R1.19).
 
     Attributes:
         event_type: Which lifecycle event to publish.
         payload: Event-type-specific data, validated against the event contract.
-        force: When ``True``, bypass the transition guard and publish anyway (R2.24).
+        force: When ``True``, bypass the transition guard and publish anyway (R1.24).
             This is the lab lever that makes the consumers' detection reachable; a
             real caller never sets it.
     """
@@ -102,7 +102,7 @@ class PublishEventRequest(BaseModel):
 
 
 class PublishEventResponse(BaseModel):
-    """Where the broker put a published event (R2.23).
+    """Where the broker put a published event (R1.23).
 
     Attributes:
         order_id: The order the event belongs to.
@@ -211,7 +211,7 @@ def create_order(body: CreateOrderRequest, request: Request) -> CreateOrderRespo
         The new order's id and where its creation event landed.
 
     Raises:
-        HTTPException: ``422`` if the payment does not equal the item sum (R2.14),
+        HTTPException: ``422`` if the payment does not equal the item sum (R1.14),
             ``502`` if the broker rejected the event, ``504`` on delivery timeout.
     """
     order_id = new_order_id()
@@ -261,11 +261,11 @@ def publish_event(
 ) -> PublishEventResponse:
     """Publish the next lifecycle event for an existing order.
 
-    Unlike 001's equivalent endpoint, this one refuses an event that the order's state
-    cannot legally reach (R2.21) — a real service owns its aggregate. ``force``
-    bypasses that guard so an out-of-order event can be put on the topic and the
-    consumers' detection observed (R2.24); a forced event advances the sequence but not
-    the recorded state.
+    The service refuses an event that the order's state cannot legally reach (R1.21) —
+    a real service owns its aggregate rather than publishing whatever it is handed.
+    ``force`` bypasses that guard so an out-of-order event can be put on the topic and
+    the consumers' detection observed (R1.24); a forced event advances the sequence but
+    not the recorded state.
 
     Args:
         order_id: Order the event belongs to; also the message key.
@@ -337,7 +337,7 @@ def publish_event(
 
 @router.get("/orders/{order_id}")
 def get_order(order_id: str, request: Request) -> dict[str, object]:
-    """Report the service's own record of one order (R2.27).
+    """Report the service's own record of one order (R1.27).
 
     Worth comparing against what the consumers derived: this is the aggregate's view,
     theirs is folded from the log.

@@ -1,6 +1,6 @@
 """Entry point for all three consumer services.
 
-``SERVICE_NAME`` selects one entry from :data:`SERVICE_REGISTRY` (R2.37, D12). Three
+``SERVICE_NAME`` selects one entry from :data:`SERVICE_REGISTRY` (R1.37, D12). Three
 containers run this same module with three different values and therefore three
 different consumer groups, which is what makes the fan-out visible:
 

@@ -65,7 +65,7 @@ def create_app() -> FastAPI:
         title="Prepaid Order Service",
         description=(
             "Creates prepaid orders and publishes their lifecycle events, keyed by "
-            "order_id. See specs/002-prepaid-order-service/."
+            "order_id. See specs/001-prepaid-order-service/."
         ),
         version="0.1.0",
         lifespan=lifespan,

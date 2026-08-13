@@ -1,12 +1,11 @@
 """The analytics service.
 
-Reacts to all four event types (R2.35) by counting them. The counter is a closure
-created per process rather than a module-level dict, so building two services in one
-interpreter — which the tests do — gives two independent counts.
+Reacts to all four event types (R1.35) by counting them. The counter is a closure
+created per process rather than a module-level dict, so two services built in one
+interpreter get independent counts.
 
-Like every count in this repository, it lives in memory and dies with the process. That
-is 001's X3 lesson repeated: the committed offset comes back on restart, the tally does
-not.
+Like every count in this repository it lives in memory and dies with the process — the
+X3 lesson again: the committed offset comes back on restart, the tally does not.
 """
 
 import logging

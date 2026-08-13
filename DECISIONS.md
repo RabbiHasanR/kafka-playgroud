@@ -7,7 +7,7 @@ supersede.
 alternatives belong in `specs/<feature>/design.md`. Two kinds of decision cannot live
 there:
 
-1. **Decisions spanning features** — the Kafka client choice binds specs 001–009; no
+1. **Decisions spanning features** — the Kafka client choice binds specs 001–008; no
    single feature's `design.md` owns it.
 2. **History** — `CLAUDE.md` requires `design.md` to be amended to match reality, so
    it always shows only the current state and its superseded reasoning is erased.
@@ -25,10 +25,10 @@ and marking the old one superseded — never editing it in place.
 
 ## X1 — Kafka client: `confluent-kafka`
 
-**Date:** 2026-08-11 **Status:** accepted **Specs:** 001–009 *(renumbered by X7)*
+**Date:** 2026-08-11 **Status:** accepted **Specs:** 001–008 *(renumbering: X7, X8)*
 
 **Context.** Every feature from 001 onward needs a Python Kafka client, and the later
-ones need `acks` tuning (005), idempotent production and transactions (009). Changing
+ones need `acks` tuning (004), idempotent production and transactions (008). Changing
 client mid-ladder would mean rewriting the producer and consumer.
 
 **Decision.** `confluent-kafka`, the librdkafka binding.
@@ -36,11 +36,11 @@ client mid-ladder would mean rewriting the producer and consumer.
 **Consequences.** It is a synchronous C-backed client, so using it inside async
 FastAPI requires care — a background `poll()` thread and synchronous route handlers
 (001 D5, D7). In exchange, `acks`, `enable.idempotence`, and the transactional API are
-exposed directly and match the Java client's semantics, so 005 and 009 need no client
+exposed directly and match the Java client's semantics, so 004 and 008 need no client
 migration.
 
 **Rejected.** `kafka-python` — pure Python and easier to read, but slower and behind
-on broker features that 009 depends on. `aiokafka` — natural async fit, but layers
+on broker features that 008 depends on. `aiokafka` — natural async fit, but layers
 asyncio complexity on top of Kafka complexity while the goal is to learn Kafka.
 
 ---
@@ -50,7 +50,7 @@ asyncio complexity on top of Kafka complexity while the goal is to learn Kafka.
 **Date:** 2026-08-11 **Status:** accepted **Specs:** 001+
 
 **Context.** The event payload format is fixed across every feature that reads or
-writes `order-events`.
+writes the lifecycle topic.
 
 **Decision.** JSON, with no schema enforcement.
 
@@ -68,8 +68,7 @@ teach.
 
 ## X3 — Consumer state at 001 is in memory, and is meant to be lost
 
-**Date:** 2026-08-11 **Status:** accepted **Specs:** 001, superseded in effect by 004
-*(renumbered by X7)*
+**Date:** 2026-08-11 **Status:** amended by X8 **Specs:** 001, superseded in effect by 003
 
 **Context.** A consumer's committed offset is a *position*; its folded per-key state
 is a *memory*. These are routinely conflated, and the conflation is invisible until a
@@ -80,44 +79,42 @@ persistence, mandated by requirement R1.27.
 
 **Consequences.** Restarting the consumer produces false sequence violations and
 wrong order totals. This is the intended result and must not be "fixed" inside 001 —
-doing so removes the evidence that motivates 004. Recorded here because a future
+doing so removes the evidence that motivates 003. Recorded here because a future
 reader will otherwise file it as a defect.
 
-**Rejected.** Starting at 004's durable store — correct code, but the reader never
+**Rejected.** Starting at 003's durable store — correct code, but the reader never
 sees the failure that justifies the machinery, and the machinery then reads as
 ceremony.
 
 ---
 
-## X4 — Durable state at 004 uses Postgres, knowing 008 replaces it
+## X4 — Durable state at 003 uses Postgres, knowing 007 replaces it
 
-**Date:** 2026-08-11 **Status:** accepted **Specs:** 004, superseded by X5 at 008
-*(renumbered by X7)*
+**Date:** 2026-08-11 **Status:** accepted **Specs:** 003, superseded by X5 at 007
 
 **Context.** Once 001's amnesia is felt, state has to go somewhere durable. The
 production-grade answer is a local state store plus a compacted changelog topic
-(X5) — so choosing Postgres at 004 is knowingly choosing the weaker option.
+(X5) — so choosing Postgres at 003 is knowingly choosing the weaker option.
 
-**Decision.** Spec 004 uses Postgres anyway.
+**Decision.** Spec 003 uses Postgres anyway.
 
 **Consequences.** Postgres puts the **dual-write problem** in plain sight: the offset
 commit and the state write are in two different systems, so no single operation can
 make them atomic, and at-least-once duplicates cannot be eliminated — only absorbed
-by idempotent upserts. That problem is the direct setup for 009, where state and
+by idempotent upserts. That problem is the direct setup for 008, where state and
 offset are both Kafka operations and one transaction covers both. Postgres also
 demonstrates the shared-database bottleneck that co-partitioned state removes.
 
-**Rejected.** Going straight to RocksDB + changelog at 004 — fewer steps, but the
-payoff at 009 lands only if the dual-write pain was felt first.
+**Rejected.** Going straight to RocksDB + changelog at 003 — fewer steps, but the
+payoff at 008 lands only if the dual-write pain was felt first.
 
 ---
 
 ## X5 — Derived state ends at RocksDB + a compacted changelog topic
 
-**Date:** 2026-08-11 **Status:** accepted **Specs:** 008, supersedes X4
-*(renumbered by X7)*
+**Date:** 2026-08-11 **Status:** accepted **Specs:** 007, supersedes X4
 
-**Context.** The endpoint of the state story, reached after 007 establishes
+**Context.** The endpoint of the state story, reached after 006 establishes
 compaction.
 
 **Decision.** A local RocksDB store for reads, with every mutation also produced to a
@@ -138,17 +135,17 @@ Adopting a framework before hand-rolling it — the mechanism is the lesson.
 
 ---
 
-## X6 — ksqlDB is the capstone at 010, deliberately not earlier
+## X6 — ksqlDB is the capstone at 009, deliberately not earlier
 
-**Date:** 2026-08-11 **Status:** accepted **Specs:** 010 *(renumbered by X7)*
+**Date:** 2026-08-11 **Status:** accepted **Specs:** 009
 
 **Context.** ksqlDB runs on Kafka Streams and therefore on RocksDB plus compacted
-changelog topics — precisely what 007 and 008 build by hand. It could technically be
-introduced at any point after 003.
+changelog topics — precisely what 006 and 007 build by hand. It could technically be
+introduced at any point after 002.
 
 **Decision.** It goes last.
 
-**Consequences.** Met before 008 it is an opaque black box that provisions topics and
+**Consequences.** Met before 007 it is an opaque black box that provisions topics and
 state directories for reasons the reader cannot see. Met after, every internal topic
 it creates is recognisable and can be matched to the hand-rolled equivalent. It also
 covers ground no earlier rung reaches: stream–table duality, windowed aggregation,
@@ -166,7 +163,12 @@ questions before the reader has learned to ask them.
 
 ## X7 — The ladder renumbers; a realistic order service takes 002
 
-**Date:** 2026-08-13 **Status:** accepted **Specs:** all
+**Date:** 2026-08-13 **Status:** superseded by X8 the same day **Specs:** all
+
+> **Superseded.** The mechanics lab this entry positions the new feature *against* was
+> removed hours later, and the prepaid order service took 001 instead. The numbering
+> below is historical; X8 has the current ladder. The reasoning is kept because it
+> records why the realistic service was wanted early, which is still why it is 001.
 
 **Context.** 001 is a mechanics lab in an order-domain costume, and says so in its own
 overview: *"The purpose is not the order domain."* Its producer accepts a
@@ -215,3 +217,65 @@ reversed — only re-indexed. This entry is the record that the shift happened.
 cheaper, and it keeps this file literally append-only, but it puts the one spec that
 answers "what does this look like in production?" behind eight rungs of mechanics.
 Also rejected: building it as a capstone after 010, for the same reason.
+
+---
+
+## X8 — The mechanics lab is removed; the order service is 001
+
+**Date:** 2026-08-13 **Status:** accepted **Specs:** all, supersedes X7, amends X3
+
+**Context.** X7 added the prepaid order service at 002 and kept the original
+`order-event-pipeline` at 001, on the reasoning that the two taught different things
+and the lab's fault-injection levers had no counterpart in a realistic service.
+
+That reasoning was sound and was overruled deliberately. Two features covering one
+domain, on two topics, with two copies of the poll thread and the consume loop, is a
+larger surface than a solo learning repository needs — and every hour spent keeping the
+two specs consistent with each other is an hour not spent on the next rung.
+
+**Decision.** Delete `src/order_pipeline/` and `specs/001-order-event-pipeline/`.
+Rename `002-prepaid-order-service` to **001**, renumber its criteria `R2.x → R1.x`, and
+shift the reserved ladder back up. The result is the pre-X7 numbering with the lab
+replaced:
+
+| Spec | Topic |
+|---|---|
+| 000 | Local Kafka environment |
+| **001** | **Prepaid order service + consumer fan-out** |
+| 002 | Consumer groups, rebalancing, partition assignment |
+| 003 | Durable consumer state |
+| 004 | Replication, `acks`, failover |
+| 005 | Retries, DLQ, poison messages |
+| 006 | Compaction, tombstones |
+| 007 | Local state stores, changelog topics |
+| 008 | Transactions, exactly-once |
+| 009 | Stream SQL / ksqlDB |
+
+X1, X4, X5 and X6 therefore return to the spec numbers they were written with, and the
+`*(renumbered by X7)*` markers are gone from them.
+
+**Consequences.** Four demonstrations left the repository with the lab and are not
+reachable from 001: unkeyed publishing (why the message key matters at all), shuffled
+publishing, rate-controlled bulk generation and the consumer-lag experiment, and the
+running-total accumulator. If any of them is wanted later it must be added as a new
+numbered experiment against `order-lifecycle`, not recovered from the old spec.
+
+`R2.45` — "leave 001's producer, consumer, topic and event contract unmodified" — had
+no meaning once there was nothing to leave alone, so it was dropped rather than
+renumbered. Its verification task T36 went with it. `R1.45` and `R1.46` are the former
+`R2.46` and `R2.47`.
+
+**Amendment to X3.** That entry says folded consumer state is in memory *mandated by
+requirement R1.27*. No such requirement exists in the new 001 — `R1.27` there is the
+`GET /orders/{order_id}` endpoint. X3's substance still holds and still motivates 003:
+each of the three services folds `(last_sequence, state)` in memory and loses it on
+restart, so a restart mid-order produces a sequence-gap violation indistinguishable
+from a real one. It is now an accepted limitation recorded in 001 D9, not a mandated
+shortcoming. **Read every `R1.x` inside X3 as belonging to the deleted spec.**
+
+**Rejected.** Keeping the lab and living with the duplication — my recommendation at
+the time, overruled on the grounds above; the trade is real and this entry is the
+record of which way it went. Also rejected: keeping `specs/001-order-event-pipeline/`
+as documentation with its code deleted, which would leave three spec documents and 33
+ticked tasks describing software that does not exist. Git history at `2ac63da` has all
+of it if it is ever wanted back.

@@ -1,15 +1,10 @@
 """Kafka producer wrapper for the order service: keyed publishing, delivery reports.
 
-Deliberately close to 001's producer, and deliberately a separate copy (D1). The two
-features own different contracts and will diverge — 004 rewrites one of them and not
-the other — so sharing this module would couple specs that are meant to move
-independently.
-
-What is *not* here is the sequence counter. 001 keeps ``{order_id: last_sequence}``
-inside its producer because it has no notion of an order. 002 does: the sequence lives
-on the :class:`~order_service.producer.orders.Order` record, allocated under the same
-lock that guards the transition check (D5). That is where a real service would keep it
-— in the row it later commits.
+What is deliberately *not* here is the sequence counter. The sequence belongs to the
+order, so it lives on the :class:`~order_service.producer.orders.Order` record and is
+allocated under the same lock that guards the transition check (D5) — the
+aggregate-version pattern, and where a real service would keep it: in the row it later
+commits.
 
 **Publishing is asynchronous even when it looks synchronous.** ``Producer.produce()``
 only appends to librdkafka's internal queue; the broker's acknowledgement arrives later
@@ -32,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DeliveryResult:
-    """Where the broker actually put a message (R2.17, R2.23).
+    """Where the broker actually put a message (R1.17, R1.23).
 
     Attributes:
         partition: Partition the broker assigned.
@@ -44,11 +39,11 @@ class DeliveryResult:
 
 
 class DeliveryFailed(Exception):
-    """The broker rejected the message or reported an error (R2.18)."""
+    """The broker rejected the message or reported an error (R1.18)."""
 
 
 class DeliveryTimeout(Exception):
-    """No delivery report arrived within the configured timeout (R2.18)."""
+    """No delivery report arrived within the configured timeout (R1.18)."""
 
 
 class LifecycleEventProducer:
@@ -65,10 +60,10 @@ class LifecycleEventProducer:
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
                 # Wait for all in-sync replicas. On the single broker of spec 000 that
-                # is just one; spec 005 makes this setting meaningful.
+                # is just one; spec 004 makes this setting meaningful.
                 "acks": "all",
                 # murmur2 hash of the key, matching the Java client. Every event for
-                # one order therefore lands on one partition (R2.10).
+                # one order therefore lands on one partition (R1.10).
                 "partitioner": "consistent_random",
                 "client.id": "order-service-producer",
             }
@@ -107,7 +102,7 @@ class LifecycleEventProducer:
     def topic_exists(self, timeout: float = 5.0) -> bool:
         """Report whether the configured topic exists on the broker.
 
-        Auto-creation is disabled (R0.14, R2.11), so a missing topic is a setup error
+        Auto-creation is disabled (R0.14, R1.11), so a missing topic is a setup error
         worth naming rather than letting it surface as a delivery timeout.
 
         Args:
@@ -139,7 +134,7 @@ class LifecycleEventProducer:
 
         Blocks until the delivery callback fires, so the caller can report the real
         partition and offset and turn a broker failure into an error rather than a
-        silent drop. This matters more here than in 001: a lost ``ORDER_CREATED`` is an
+        silent drop. That matters: a lost ``ORDER_CREATED`` is an
         order that exists for the customer and for nobody else.
 
         Callers must not run this on an event loop — the route handlers are
@@ -178,7 +173,7 @@ class LifecycleEventProducer:
         if not done.wait(wait):
             # librdkafka treats an unknown topic as retriable and keeps retrying until
             # the message timeout, so a missing topic surfaces as a plain timeout.
-            # R2.11 asks for an explicit error, so name the real cause — but only when
+            # R1.11 asks for an explicit error, so name the real cause — but only when
             # metadata actually says the topic is missing. If the metadata call itself
             # fails the broker is unreachable, which is a different fault and must not
             # be reported as a missing topic.

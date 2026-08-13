@@ -1,6 +1,6 @@
 """The inventory service.
 
-Reacts to two of the four event types and ignores the rest (R2.33) — which is the
+Reacts to two of the four event types and ignores the rest (R1.33) — which is the
 point worth noticing. It is subscribed to the same topic as the other two services and
 receives every message; caring about only some of them is a property of the *handler
 map*, not of the subscription. Adding a service that cares about different events costs
