@@ -1,12 +1,10 @@
 """Entry point for all three consumer services.
 
 ``SERVICE_NAME`` selects one entry from :data:`SERVICE_REGISTRY` (R1.37, D12). Three
-containers run this same module with three different values and therefore three
-different consumer groups, which is what makes the fan-out visible:
+containers run this module with three different values, and so three different
+consumer groups:
 
     docker compose logs -f inventory-consumer notification-consumer analytics-consumer
-
-One event, three reactions, three independent offsets.
 """
 
 import logging
@@ -28,10 +26,8 @@ logging.basicConfig(
 
 logger = logging.getLogger("order_service.consumer")
 
-#: Every service this image can run, by ``SERVICE_NAME``.
-#:
-#: Factories rather than instances, so per-service state — analytics' counter — is
-#: created fresh per process instead of shared at import time.
+#: Every service this image can run, by ``SERVICE_NAME``. Factories rather than
+#: instances, so per-service state is created fresh per process, not at import time.
 SERVICE_REGISTRY: dict[str, Callable[[], ServiceSpec]] = {
     inventory.SERVICE_NAME: inventory.build_service,
     notification.SERVICE_NAME: notification.build_service,
@@ -41,12 +37,6 @@ SERVICE_REGISTRY: dict[str, Callable[[], ServiceSpec]] = {
 
 def build_spec(service_name: str) -> ServiceSpec:
     """Look up and build one service by name.
-
-    Args:
-        service_name: The ``SERVICE_NAME`` to resolve.
-
-    Returns:
-        The built :class:`~order_service.consumer.runtime.ServiceSpec`.
 
     Raises:
         KeyError: If no service with that name is registered.

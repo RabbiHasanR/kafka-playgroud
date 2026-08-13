@@ -1,12 +1,8 @@
 """The inventory service.
 
-Reacts to two of the four event types and ignores the rest (R1.33) — which is the
-point worth noticing. It is subscribed to the same topic as the other two services and
-receives every message; caring about only some of them is a property of the *handler
-map*, not of the subscription. Adding a service that cares about different events costs
-a container, not a producer change.
-
-The work is a log line. Reserving real stock is not what this feature is about.
+Receives every message like the other two, but reacts to only ``ORDER_CREATED`` and
+``SHIPPED`` (R1.33) — a property of the handler map, not of the subscription. The work
+is a log line; reserving real stock is out of scope.
 """
 
 import logging
@@ -20,11 +16,7 @@ SERVICE_NAME = "inventory"
 
 
 def _reserve_stock(event: LifecycleEvent) -> None:
-    """Reserve stock for every line item of a new order.
-
-    Args:
-        event: The ``ORDER_CREATED`` event.
-    """
+    """Reserve stock for every line item of a new order."""
     payload = event.as_order_created()
     for item in payload.items:
         logger.info(
@@ -37,11 +29,7 @@ def _reserve_stock(event: LifecycleEvent) -> None:
 
 
 def _release_reservation(event: LifecycleEvent) -> None:
-    """Turn a reservation into a committed stock movement once the parcel ships.
-
-    Args:
-        event: The ``SHIPPED`` event.
-    """
+    """Turn a reservation into a committed stock movement once the parcel ships."""
     payload = event.as_shipped()
     logger.info(
         "[%s] reservation for %s committed — handed to %s (%s)",
@@ -53,11 +41,7 @@ def _release_reservation(event: LifecycleEvent) -> None:
 
 
 def build_service() -> ServiceSpec:
-    """Build the inventory service specification.
-
-    Returns:
-        A spec handling ``ORDER_CREATED`` and ``SHIPPED`` only.
-    """
+    """Build the inventory service spec: ``ORDER_CREATED`` and ``SHIPPED`` only."""
     handlers: dict[EventType, Handler] = {
         EventType.ORDER_CREATED: _reserve_stock,
         EventType.SHIPPED: _release_reservation,

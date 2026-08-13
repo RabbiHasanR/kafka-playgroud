@@ -1,16 +1,9 @@
 """Kafka producer wrapper for the order service: keyed publishing, delivery reports.
 
-What is deliberately *not* here is the sequence counter. The sequence belongs to the
-order, so it lives on the :class:`~order_service.producer.orders.Order` record and is
-allocated under the same lock that guards the transition check (D5) — the
-aggregate-version pattern, and where a real service would keep it: in the row it later
-commits.
-
-**Publishing is asynchronous even when it looks synchronous.** ``Producer.produce()``
-only appends to librdkafka's internal queue; the broker's acknowledgement arrives later
-on a delivery callback, and callbacks only fire while somebody calls ``poll()``. Hence
-the background poll thread — without it a caller waiting on a delivery report would
-wait forever.
+``Producer.produce()`` only appends to librdkafka's internal queue; the broker's
+acknowledgement arrives later on a delivery callback, and callbacks only fire while
+somebody calls ``poll()``. Hence the background poll thread — without it a caller
+waiting on a delivery report would wait forever.
 """
 
 import logging
@@ -27,12 +20,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DeliveryResult:
-    """Where the broker actually put a message (R1.17, R1.23).
-
-    Attributes:
-        partition: Partition the broker assigned.
-        offset: Offset within that partition.
-    """
+    """Where the broker actually put a message (R1.17, R1.23)."""
 
     partition: int
     offset: int
@@ -50,17 +38,10 @@ class LifecycleEventProducer:
     """Publishes lifecycle events keyed by ``order_id``."""
 
     def __init__(self, settings: Settings) -> None:
-        """Initialise the producer.
-
-        Args:
-            settings: Resolved runtime settings.
-        """
         self._settings = settings
         self._producer = Producer(
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
-                # Wait for all in-sync replicas. On the single broker of spec 000 that
-                # is just one; spec 004 makes this setting meaningful.
                 "acks": "all",
                 # murmur2 hash of the key, matching the Java client. Every event for
                 # one order therefore lands on one partition (R1.10).
@@ -102,9 +83,6 @@ class LifecycleEventProducer:
     def topic_exists(self, timeout: float = 5.0) -> bool:
         """Report whether the configured topic exists on the broker.
 
-        Auto-creation is disabled (R0.14, R1.11), so a missing topic is a setup error
-        worth naming rather than letting it surface as a delivery timeout.
-
         Args:
             timeout: Seconds to wait for cluster metadata.
 
@@ -113,8 +91,7 @@ class LifecycleEventProducer:
 
         Raises:
             KafkaException: If cluster metadata could not be fetched at all — an
-                unreachable broker is a different failure from a missing topic and
-                must not be reported as one.
+                unreachable broker is a different failure from a missing topic.
         """
         metadata = self._producer.list_topics(timeout=timeout)
         topic = metadata.topics.get(self._settings.order_lifecycle_topic)
@@ -130,15 +107,10 @@ class LifecycleEventProducer:
     def publish_and_wait(
         self, event: LifecycleEvent, *, timeout: float | None = None
     ) -> DeliveryResult:
-        """Publish an event and wait for the broker to acknowledge it.
+        """Publish an event and block until the broker acknowledges it.
 
-        Blocks until the delivery callback fires, so the caller can report the real
-        partition and offset and turn a broker failure into an error rather than a
-        silent drop. That matters: a lost ``ORDER_CREATED`` is an
-        order that exists for the customer and for nobody else.
-
-        Callers must not run this on an event loop — the route handlers are
-        synchronous ``def`` for exactly this reason (D6).
+        Must not run on an event loop — the route handlers are synchronous ``def``
+        for exactly this reason (D6).
 
         Args:
             event: The event to publish.
@@ -171,12 +143,10 @@ class LifecycleEventProducer:
         self._produce(event, on_delivery=on_delivery)
 
         if not done.wait(wait):
-            # librdkafka treats an unknown topic as retriable and keeps retrying until
-            # the message timeout, so a missing topic surfaces as a plain timeout.
-            # R1.11 asks for an explicit error, so name the real cause — but only when
-            # metadata actually says the topic is missing. If the metadata call itself
-            # fails the broker is unreachable, which is a different fault and must not
-            # be reported as a missing topic.
+            # librdkafka treats an unknown topic as retriable, so a missing topic
+            # surfaces as a plain timeout. R1.11 asks for an explicit error — but only
+            # when metadata actually says it is missing; a failing metadata call means
+            # an unreachable broker, which is a different fault.
             try:
                 topic_missing = not self.topic_exists()
             except KafkaException:
@@ -196,10 +166,6 @@ class LifecycleEventProducer:
 
     def _produce(self, event: LifecycleEvent, *, on_delivery: object) -> None:
         """Enqueue an event for delivery, keyed by ``order_id``.
-
-        Args:
-            event: The event to publish.
-            on_delivery: Callback invoked when the delivery report arrives.
 
         Raises:
             DeliveryFailed: If librdkafka refused to enqueue the message.

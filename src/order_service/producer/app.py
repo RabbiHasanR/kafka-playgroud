@@ -1,9 +1,6 @@
 """FastAPI application hosting the order service.
 
 The lifespan owns the Kafka producer, its poll thread, and the order store (D6).
-Delivery callbacks only fire while somebody calls ``poll()``, so without that thread a
-request waiting on a delivery report would hang until its timeout — a failure that
-looks like a broker problem and is not one.
 """
 
 import logging
@@ -27,14 +24,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Start and stop the Kafka producer alongside the application.
-
-    Args:
-        app: The application whose state holds the producer and the order store.
-
-    Yields:
-        Control to the running application.
-    """
+    """Start and stop the Kafka producer alongside the application."""
     settings = get_settings()
     producer = LifecycleEventProducer(settings)
     producer.start()
@@ -56,11 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 def create_app() -> FastAPI:
-    """Build the order service application.
-
-    Returns:
-        The configured FastAPI application.
-    """
+    """Build the order service application."""
     app = FastAPI(
         title="Prepaid Order Service",
         description=(

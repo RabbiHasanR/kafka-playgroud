@@ -1,8 +1,7 @@
 """The notification service.
 
-Reacts to all four event types (R1.34) with a different customer-facing message each
-time. One handler serves every type, with the wording chosen from a table — four
-near-identical handler functions would be four places to fix a typo.
+Reacts to all four event types (R1.34). One handler serves every type, with the
+wording chosen from :data:`MESSAGES`.
 """
 
 import logging
@@ -24,14 +23,7 @@ MESSAGES: dict[EventType, str] = {
 
 
 def _message_for(event: LifecycleEvent) -> str:
-    """Compose the customer-facing message for one event.
-
-    Args:
-        event: The event to describe.
-
-    Returns:
-        The message body, with shipping details appended where they exist.
-    """
+    """Compose the customer-facing message, with payload details where they exist."""
     message = MESSAGES[event.event_type]
     if event.event_type is EventType.SHIPPED:
         shipped = event.as_shipped()
@@ -43,11 +35,7 @@ def _message_for(event: LifecycleEvent) -> str:
 
 
 def _notify(event: LifecycleEvent) -> None:
-    """Send the customer the message for this event.
-
-    Args:
-        event: The event that triggered the notification.
-    """
+    """Send the customer the message for this event."""
     logger.info(
         "[%s] → customer of %s: %s",
         SERVICE_NAME,
@@ -57,11 +45,7 @@ def _notify(event: LifecycleEvent) -> None:
 
 
 def build_service() -> ServiceSpec:
-    """Build the notification service specification.
-
-    Returns:
-        A spec handling all four event types.
-    """
+    """Build the notification service spec, handling all four event types."""
     handlers: dict[EventType, Handler] = {
         event_type: _notify for event_type in EventType
     }

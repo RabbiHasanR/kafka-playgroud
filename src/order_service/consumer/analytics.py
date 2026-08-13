@@ -1,11 +1,8 @@
 """The analytics service.
 
-Reacts to all four event types (R1.35) by counting them. The counter is a closure
-created per process rather than a module-level dict, so two services built in one
-interpreter get independent counts.
-
-Like every count in this repository it lives in memory and dies with the process — the
-X3 lesson again: the committed offset comes back on restart, the tally does not.
+Counts all four event types (R1.35). The counter is a closure rather than a
+module-level dict, so two services built in one interpreter get independent counts.
+It lives in memory: the committed offset comes back on restart, the tally does not.
 """
 
 import logging
@@ -20,19 +17,11 @@ SERVICE_NAME = "analytics"
 
 
 def build_service() -> ServiceSpec:
-    """Build the analytics service specification.
-
-    Returns:
-        A spec handling all four event types, sharing one counter between them.
-    """
+    """Build the analytics service spec, all four types sharing one counter."""
     counts: Counter[EventType] = Counter()
 
     def _count(event: LifecycleEvent) -> None:
-        """Count one event and log the running tally.
-
-        Args:
-            event: The event to count.
-        """
+        """Count one event and log the running tally."""
         counts[event.event_type] += 1
         tally = " ".join(
             f"{event_type}={counts[event_type]}"

@@ -1,27 +1,15 @@
 """The one consume loop, shared by all three services.
 
-A service is data, not code: a :class:`ServiceSpec` carrying a name, a consumer group,
-and a ``dict[EventType, Handler]``. ``SERVICE_NAME`` picks one at startup, so all three
-run from one image and one entry point (D8, R1.37). Three near-identical poll loops is
-the obvious wrong turn — the third copy is where the offset-commit bug gets fixed in
-two places and not the third.
+A service is data, not code: a :class:`ServiceSpec` carrying a name and a
+``dict[EventType, Handler]``. ``SERVICE_NAME`` picks one at startup, so all three run
+from one image and one entry point (D8, R1.37).
 
-**Each service is its own consumer group, and that is the whole lesson (D7).** Kafka
-tracks an offset per group, so all three read every message and none of them consumes
-it away from the others. Stopping one cannot affect the others because their offsets
-were never shared. Spec 002 adds a second consumer to *one* group, where the messages
-divide instead of duplicating — meeting fan-out first is what makes that a contrast.
+Each service is its own consumer group (D7). Kafka tracks an offset per group, so all
+three read every message and stopping one cannot affect the others.
 
-**Offsets are committed after the handler returns, never before (R1.32).** That makes
-this at-least-once: a crash between handling an event and committing its offset means
-the event is redelivered and rehandled. Not solved here — deduplication on ``event_id``
-is 003 and 008.
-
-**The fold is not persisted.** Each service keeps its own per-order
-``(last_sequence, state)`` in memory and loses it on restart. A committed offset is a
-*position*; the fold is a *memory*, and only the first of those comes back — so the
-sequence-gap violation that follows a restart is indistinguishable from a real one.
-That is the failure spec 003 exists to fix (X3).
+Offsets are committed after the handler returns, never before (R1.32) — at-least-once
+delivery. The fold is in-memory and lost on restart, so a post-restart sequence-gap
+violation is indistinguishable from a real one (X3).
 """
 
 import json
@@ -44,8 +32,8 @@ from order_service.events import (
 
 logger = logging.getLogger(__name__)
 
-#: What a service does with one event. Handlers log; they do not return anything, and
-#: raising is not part of the contract at this spec — poison-message handling is 005.
+#: What a service does with one event. Handlers log and return nothing; raising is not
+#: part of the contract at this spec.
 Handler = Callable[[LifecycleEvent], None]
 
 
@@ -55,9 +43,8 @@ class ServiceSpec:
 
     Attributes:
         name: Short service name, used in logs and to derive the group id.
-        handlers: Which event types this service reacts to, and how. Types absent
-            from the map are skipped without error — that is what "ignores the other
-            events" means mechanically (R1.33).
+        handlers: Which event types this service reacts to. Types absent from the map
+            are skipped without error (R1.33).
     """
 
     name: str
@@ -73,15 +60,7 @@ class ViolationType(StrEnum):
 
 @dataclass(frozen=True)
 class Violation:
-    """A single detected violation.
-
-    Attributes:
-        type: Which check failed.
-        order_id: The order the failing event belongs to.
-        sequence: Sequence of the failing event.
-        expected: What the service expected to see.
-        observed: What it actually saw.
-    """
+    """A single detected violation."""
 
     type: ViolationType
     order_id: str
@@ -90,11 +69,7 @@ class Violation:
     observed: str
 
     def as_log_fields(self) -> str:
-        """Render the violation as a single log line body.
-
-        Returns:
-            A stable, greppable representation.
-        """
+        """Render the violation as a stable, greppable log line body."""
         return (
             f"VIOLATION type={self.type} order_id={self.order_id} "
             f"seq={self.sequence} expected={self.expected} observed={self.observed}"
@@ -103,13 +78,7 @@ class Violation:
 
 @dataclass(frozen=True)
 class OrderFold:
-    """What a service has accumulated about one order.
-
-    Attributes:
-        order_id: The order this describes.
-        last_sequence: Sequence of the most recent event applied.
-        state: Lifecycle state after that event.
-    """
+    """What a service has accumulated about one order."""
 
     order_id: str
     last_sequence: int = 0
@@ -121,12 +90,9 @@ def apply_event(
 ) -> tuple[OrderFold, list[Violation]]:
     """Fold one event into a service's view of an order, reporting violations.
 
-    A pure function of ``(fold, event) -> (fold, violations)``, so it is testable
-    without a broker and can be re-hosted on a durable store in 003 by changing only
-    where the state comes from and goes to.
-
-    The event is applied even when it violates an expectation, so consumption continues
-    (R1.40) and one bad event does not poison every later one.
+    Pure, so the state can later be re-hosted on a durable store by changing only
+    where it comes from and goes to. The event is applied even when it violates an
+    expectation, so consumption continues (R1.40).
 
     Args:
         current: The service's existing fold for this order, or ``None`` if unseen.
@@ -139,9 +105,8 @@ def apply_event(
     violations: list[Violation] = []
 
     # -- sequence contiguity (R1.38) -------------------------------------------
-    # For an unseen order last_sequence is 0, so the expected sequence is 1 and
-    # anything else is a gap. This is the same code path that fires after a restart,
-    # which is precisely why the two are indistinguishable.
+    # An unseen order has last_sequence 0, so anything but 1 is a gap — the same code
+    # path that fires after a restart, which is why the two are indistinguishable.
     expected_sequence = fold.last_sequence + 1
     if event.sequence != expected_sequence:
         violations.append(
@@ -183,12 +148,6 @@ class ServiceConsumer:
     """Runs one service against the lifecycle topic."""
 
     def __init__(self, spec: ServiceSpec, settings: Settings) -> None:
-        """Initialise the consumer.
-
-        Args:
-            spec: The service to run.
-            settings: Resolved runtime settings.
-        """
         self._spec = spec
         self._settings = settings
         self._group_id = settings.group_id_for(spec.name)
@@ -197,13 +156,12 @@ class ServiceConsumer:
         self._consumer = Consumer(
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
-                # Its own group — this is what makes it fan-out rather than
-                # scale-out (D7).
+                # Its own group — fan-out rather than scale-out (D7).
                 "group.id": self._group_id,
-                # Offsets are committed by hand, after the handler runs (R1.32).
+                # Committed by hand, after the handler runs (R1.32).
                 "enable.auto.commit": False,
-                # A group with no committed offsets starts at the earliest retained
-                # message, so a fresh group id replays the whole topic.
+                # No committed offsets means start at the earliest retained message,
+                # so a fresh group id replays the whole topic.
                 "auto.offset.reset": "earliest",
                 "client.id": f"order-service-{spec.name}",
             }
@@ -211,11 +169,7 @@ class ServiceConsumer:
 
     @property
     def group_id(self) -> str:
-        """Return the consumer group this service joined.
-
-        Returns:
-            The resolved group id.
-        """
+        """Return the consumer group this service joined."""
         return self._group_id
 
     def stop(self) -> None:
@@ -257,9 +211,6 @@ class ServiceConsumer:
     def _handle_error(self, message: Message) -> None:
         """Log a broker-reported error on a polled message.
 
-        Args:
-            message: The message carrying the error.
-
         Raises:
             KafkaException: If the error is fatal.
         """
@@ -273,12 +224,8 @@ class ServiceConsumer:
     def _handle_message(self, message: Message) -> None:
         """Decode, detect, dispatch, and commit one message.
 
-        A message that cannot be parsed is logged and its offset committed anyway —
-        retry and dead-letter handling is spec 005, and stalling here would block the
-        partition for this service.
-
-        Args:
-            message: The message to process.
+        An unparseable message is logged and its offset committed anyway; stalling
+        here would block the partition for this service.
         """
         raw = message.value()
         key = message.key()
@@ -296,9 +243,7 @@ class ServiceConsumer:
             self._consumer.commit(message=message, asynchronous=False)
             return
 
-        # R1.42 — the service name comes first so three interleaved log streams stay
-        # readable, and partition/offset/key make the routing visible without opening
-        # Kafka UI.
+        # R1.42 — service name first so three interleaved log streams stay readable.
         logger.info(
             "[%s] partition=%d offset=%d key=%s order_id=%s seq=%d type=%s",
             self._spec.name,
@@ -313,8 +258,8 @@ class ServiceConsumer:
         updated, violations = apply_event(self._folds.get(event.order_id), event)
         self._folds[event.order_id] = updated
         for violation in violations:
-            # R1.41 — WARNING and a stable marker, so `grep VIOLATION` across all
-            # three services is the whole filtering story.
+            # R1.41 — WARNING and a stable marker, so `grep VIOLATION` is the whole
+            # filtering story.
             logger.warning(
                 "[%s] %s partition=%d offset=%d",
                 self._spec.name,
