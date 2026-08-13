@@ -75,12 +75,6 @@ decision it follows.
   gated on broker health, with `KAFKA_BOOTSTRAP_SERVERS=kafka:19092`, changing no
   broker configuration. — *R1.33* — D15
 
-## Tests
-
-- [x] **T22** — Unit-test the fold function without a broker: happy path, sequence
-  gap, unknown order starting above 1, illegal transition, and total mismatch.
-  — *R1.18, R1.19, R1.20, R1.21, R1.24*
-
 ## Verification experiments
 
 Each is run and observed, not merely coded. Tick only after actually running it.
@@ -130,6 +124,12 @@ Each is run and observed, not merely coded. Tick only after actually running it.
   filter. — *R1.30, R1.33*
 
 ## Notes
+
+**T22 is gone, and the number is deliberately not reused.** It was a unit test of the
+fold function. This project does not carry a test suite (see `CLAUDE.md`); correctness
+is established by the T23–T33 experiments, which exercise the same code against a real
+broker. The requirements it cited stay covered: R1.18 by T12, R1.19 and R1.24 by T13,
+R1.20 by T14, R1.21 by T15.
 
 **Pending process change, not a task.** `CLAUDE.md`'s *Layout* section needs a rule
 recording `DECISIONS.md` and the routing rule between it and `design.md`, or the

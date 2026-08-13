@@ -70,6 +70,20 @@ quietly keeping it.
 - No hardcoded secrets or connection strings — environment variables only.
 - Conventional commits (`feat/fix/refactor/test/chore/docs/ci`).
 
+## Testing
+
+**This project has no test suite. Do not write tests, and do not add one.** No
+`tests/` directory, no pytest, no test tasks in `tasks.md`.
+
+Correctness is established by the **verification experiments** in each feature's
+`tasks.md` — run against a real broker, observed, and their results recorded in the
+spec. That is the stronger evidence here: the questions this repo asks are about how
+Kafka actually behaves (does the key really pin the partition, does a stopped group
+really not block the others), and a mocked broker cannot answer any of them.
+
+If a change needs checking, run the experiments. If it needs a *new* check, add a
+numbered experiment that cites a requirement — not a unit test.
+
 ## Git
 
 **Commit to `master`. Never create a branch unless I explicitly ask for one.**

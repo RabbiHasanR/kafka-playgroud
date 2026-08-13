@@ -178,7 +178,7 @@ chain `CREATED → PAID → PACKED → SHIPPED → DELIVERED`.
 `{order_id: OrderState}` where `OrderState` carries `last_sequence`, `state`,
 `item_count`, and `total`. No persistence, by requirement. The fold logic lives in
 `consumer/state.py` as a pure function of `(current_state, event) → (new_state,
-violations)`, so it is unit-testable without a broker and survives being re-hosted on
+violations)`, so it is readable in isolation and survives being re-hosted on
 a durable store in spec 004.
 
 ### D12 — Manual commit after processing — *R1.22, R1.25*

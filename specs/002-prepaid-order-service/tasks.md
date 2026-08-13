@@ -88,22 +88,6 @@ decision it follows.
   `SERVICE_NAME` and distinct `CONSUMER_GROUP_ID`, changing no broker configuration and
   leaving 001's services untouched. — *R2.28, R2.44, R2.45* — D7, D12
 
-## Tests
-
-- [x] **T23** — Unit-test the contract without a broker: a payment total that disagrees
-  with the item sum is rejected, an empty item list is rejected, and a `SHIPPED` payload
-  missing its carrier is rejected. — *R2.6, R2.7, R2.14, R2.15*
-- [x] **T24** — Unit-test the order store without a broker: sequences start at 1 and
-  increase by exactly 1, an unknown order and an illegal successor raise distinct
-  errors, a forced reservation bypasses the guard while still taking the next sequence
-  and leaving the state unchanged. — *R2.3, R2.20, R2.21, R2.24, R2.26*
-- [x] **T25** — Unit-test the consumer fold without a broker: a clean chain produces no
-  violations, an out-of-order event produces an illegal-transition violation, and a
-  skipped sequence produces a sequence-gap violation. — *R2.38, R2.39, R2.40*
-- [x] **T26** — Unit-test the service registry: each service resolves to a distinct
-  group id, and inventory's handler map covers `ORDER_CREATED` and `SHIPPED` only while
-  the other two cover all four. — *R2.33, R2.34, R2.35, R2.37*
-
 ## Verification experiments
 
 Each is run and observed, not merely coded. Tick only after actually running it.
@@ -170,6 +154,13 @@ Inventory logging `PACKED` and `DELIVERED` at `INFO` while producing no handler 
 is T18 working, not a miss: it receives every event and reacts to two of them.
 
 ## Notes
+
+**T23–T26 are gone, and the numbers are deliberately not reused.** They were unit
+tests. This project does not carry a test suite (see `CLAUDE.md`); correctness is
+established by the T27–T36 experiments above, run against a real broker. The
+requirements they cited stay covered: R2.6, R2.7, R2.14 and R2.15 by T3 and T4; R2.3,
+R2.20, R2.21, R2.24 and R2.26 by T9, T10 and T12; R2.38, R2.39 and R2.40 by T15 and
+T16; R2.33, R2.34, R2.35 and R2.37 by T18–T21.
 
 **T31 is the task that keeps this a Kafka feature.** Without `force`, the producer's
 own guard (T10, T12) would make T15 and T16 unreachable — a service that never emits an

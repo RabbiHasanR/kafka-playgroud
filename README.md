@@ -206,7 +206,7 @@ no total at all.
 Install (Python 3.11+):
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
 Start the broker and create the topic — auto-creation is off, so this is required:
