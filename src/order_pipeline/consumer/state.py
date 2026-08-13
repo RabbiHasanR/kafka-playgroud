@@ -1,7 +1,7 @@
 """Per-order folded state and violation detection.
 
 The fold is a **pure function** of ``(current_state, event) -> (new_state,
-violations)``. That keeps it testable without a broker (T22), and it means spec 003
+violations)``. That keeps it testable without a broker (T22), and it means spec 004
 can re-host the same logic on a durable store by changing only where the state comes
 from and goes to — not how it is computed.
 
@@ -204,7 +204,7 @@ class OrderStateStore:
     **This deliberately has no persistence** (R1.27, X3). Restarting the consumer
     loses every fold while Kafka faithfully restores the committed offset — which
     is the entire point of the feature. Do not add a durable backing store here;
-    spec 003 does that, and it needs this failure to motivate it.
+    spec 004 does that, and it needs this failure to motivate it.
     """
 
     def __init__(self) -> None:

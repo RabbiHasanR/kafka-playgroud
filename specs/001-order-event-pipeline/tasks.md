@@ -150,4 +150,4 @@ Every T23–T33 experiment was run from the host against `localhost:9092`, which
 exercises R1.33's host half but not its container half.
 
 **T18 must not be "improved".** It mandates a shortcoming (R1.27, X3). Adding
-persistence here would remove the evidence that motivates spec 003.
+persistence here would remove the evidence that motivates spec 004.

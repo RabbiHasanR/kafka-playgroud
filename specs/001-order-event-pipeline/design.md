@@ -38,7 +38,7 @@ state** lives in the consumer's process memory and survives nothing.
 
 ### D1 — `confluent-kafka` as the client — *R1.7, R1.12, R1.13*
 
-See [X1](../../DECISIONS.md). Binds every spec from here to 008, so it is recorded
+See [X1](../../DECISIONS.md). Binds every spec from here to 009, so it is recorded
 cross-cutting rather than here.
 
 ### D2 — Key is the raw `order_id`, default partitioner — *R1.7, R1.8, R1.15*
@@ -96,7 +96,7 @@ sets a `threading.Event` carrying the result; the handler waits on it with a tim
 and returns `504` if the timeout expires.
 
 This is the produce-side latency/guarantee tradeoff made visible at the API boundary,
-and it is the same tradeoff `acks` controls in spec 004.
+and it is the same tradeoff `acks` controls in spec 005.
 
 **Missing topics are diagnosed, not left as timeouts.** librdkafka treats an unknown
 topic as *retriable* and keeps retrying until the message timeout, so R1.9's "explicit
@@ -179,7 +179,7 @@ chain `CREATED → PAID → PACKED → SHIPPED → DELIVERED`.
 `item_count`, and `total`. No persistence, by requirement. The fold logic lives in
 `consumer/state.py` as a pure function of `(current_state, event) → (new_state,
 violations)`, so it is unit-testable without a broker and survives being re-hosted on
-a durable store in spec 003.
+a durable store in spec 004.
 
 ### D12 — Manual commit after processing — *R1.22, R1.25*
 
@@ -188,7 +188,7 @@ a durable store in spec 003.
 which will then be re-folded and inflate the running total.
 
 That duplicate-processing consequence is not fixed here — it is the subject of spec
-003, and 008 resolves it properly. Recorded so it is not mistaken for an oversight.
+004, and 009 resolves it properly. Recorded so it is not mistaken for an oversight.
 
 `auto.offset.reset=earliest` satisfies R1.28 for a fresh group id.
 
@@ -207,7 +207,7 @@ elegant, but harder to diff and awkward inside a container.
 factor 1, invoking the CLI inside the broker container. Auto-creation is off (R0.14),
 so this is a required setup step and a deliberate one.
 
-Replication factor 1 is forced by the single-broker environment from 000; spec 004
+Replication factor 1 is forced by the single-broker environment from 000; spec 005
 raises it.
 
 ### D15 — Configuration through environment variables — *R1.32, R1.33*
@@ -248,14 +248,15 @@ module that may be.
 
 | Gap | Requirement | Closed by |
 |---|---|---|
-| Folded state lost on consumer restart | R1.27 | 003 |
+| Folded state lost on consumer restart | R1.27 | 004 |
 | Producer sequence counters lost on restart | D8 | — (accepted) |
-| Duplicate processing after a crash | D12 | 003, 008 |
-| Single broker, RF 1, no failover | D14 | 004 |
+| Duplicate processing after a crash | D12 | 004, 009 |
+| Single broker, RF 1, no failover | D14 | 005 |
 | No schema enforcement on the JSON | D3 | later |
 
 ## Deferred to later specs
 
-Nothing in this feature may anticipate them: consumer groups and rebalancing (002),
-durable state (003), replication (004), dead-letter handling (005), compaction (006),
-changelog state stores (007), transactions (008), stream SQL (009).
+Nothing in this feature may anticipate them: the prepaid order service and
+multi-service fan-out (002), consumer groups and rebalancing (003), durable state
+(004), replication (005), dead-letter handling (006), compaction (007), changelog
+state stores (008), transactions (009), stream SQL (010).

@@ -6,7 +6,7 @@ Two things here are the whole lesson of spec 001.
 That makes this *at-least-once*: a crash between folding an event and committing its
 offset means the event is re-delivered and re-folded on restart, inflating the
 running total. That duplicate is not a bug to be patched here — it is the subject of
-spec 003, and spec 008 resolves it properly.
+spec 004, and spec 009 resolves it properly.
 
 **The folded state is never persisted (R1.27, X3).**
 Kafka restores the committed offset on restart because the broker stores it. Nothing
@@ -126,7 +126,7 @@ class OrderEventConsumer:
 
         The offset is committed only after the fold has been applied (R1.25). A
         message that cannot be parsed is logged and its offset committed anyway —
-        retry and dead-letter handling is spec 005, and stalling here would block
+        retry and dead-letter handling is spec 006, and stalling here would block
         the partition.
 
         Args:

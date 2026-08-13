@@ -70,7 +70,7 @@ class OrderEventProducer:
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
                 # Wait for all in-sync replicas. On the single broker of spec 000
-                # that is just one; spec 004 makes this setting meaningful.
+                # that is just one; spec 005 makes this setting meaningful.
                 "acks": "all",
                 # murmur2 hash of the key, random when the key is null (D2).
                 "partitioner": "consistent_random",

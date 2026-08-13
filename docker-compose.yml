@@ -92,5 +92,65 @@ services:
       kafka:
         condition: service_healthy
 
+  # --- spec 002: prepaid order service + consumer fan-out -----------------
+  # One image, four commands. The three consumers subscribe to the SAME topic
+  # with THREE DIFFERENT group ids — that is the fan-out: each one receives
+  # every event and keeps its own offset. Spec 003 does the opposite, adding a
+  # second consumer to one group so the messages divide instead.
+
+  order-service:
+    build: .
+    container_name: order-service
+    command: python -m order_service.producer.app
+    ports:
+      - "8010:8010"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_LIFECYCLE_TOPIC: order-lifecycle
+      ORDER_SERVICE_HOST: 0.0.0.0
+      ORDER_SERVICE_PORT: 8010
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  inventory-consumer:
+    build: .
+    container_name: inventory-consumer
+    command: python -m order_service.consumer.main
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_LIFECYCLE_TOPIC: order-lifecycle
+      SERVICE_NAME: inventory
+      CONSUMER_GROUP_ID: inventory-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  notification-consumer:
+    build: .
+    container_name: notification-consumer
+    command: python -m order_service.consumer.main
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_LIFECYCLE_TOPIC: order-lifecycle
+      SERVICE_NAME: notification
+      CONSUMER_GROUP_ID: notification-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  analytics-consumer:
+    build: .
+    container_name: analytics-consumer
+    command: python -m order_service.consumer.main
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      ORDER_LIFECYCLE_TOPIC: order-lifecycle
+      SERVICE_NAME: analytics
+      CONSUMER_GROUP_ID: analytics-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+
 volumes:
   kafka-data:

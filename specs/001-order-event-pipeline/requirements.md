@@ -34,14 +34,15 @@ This is the first feature in the repository to contain application code.
 
 Each of these is a later feature; none may be built here.
 
-- Multiple consumers, consumer groups, rebalancing, partition assignment (002)
-- Durable or external consumer state, delivery-semantic hardening (003)
-- Multi-broker clusters, replication, `acks` tuning, failover (004)
-- Retries, dead-letter topics, poison-message handling (005)
-- Log compaction and tombstones (006)
-- Local state stores and changelog topics (007)
-- Transactions and exactly-once semantics (008)
-- Stream processing engines and SQL over streams (009)
+- A realistic prepaid order service and multi-service fan-out (002)
+- Multiple consumers, consumer groups, rebalancing, partition assignment (003)
+- Durable or external consumer state, delivery-semantic hardening (004)
+- Multi-broker clusters, replication, `acks` tuning, failover (005)
+- Retries, dead-letter topics, poison-message handling (006)
+- Log compaction and tombstones (007)
+- Local state stores and changelog topics (008)
+- Transactions and exactly-once semantics (009)
+- Stream processing engines and SQL over streams (010)
 - Schema Registry, Avro/Protobuf, schema evolution
 - Authentication, TLS, ACLs — the environment stays PLAINTEXT per 000
 
@@ -154,7 +155,7 @@ position and derived state are different things.
 - **R1.27** — WHEN the consumer restarts THE SYSTEM SHALL NOT restore any per-order
   state accumulated before the restart. (Intentional for this feature: the resulting
   false violations and wrong totals are the evidence that a committed offset is a
-  position, not a memory. Spec 003 removes this.)
+  position, not a memory. Spec 004 removes this.)
 - **R1.28** — WHERE the consumer is started with a previously unused group identity
   THE SYSTEM SHALL read the topic from its earliest retained offset.
 
@@ -180,4 +181,4 @@ position and derived state are different things.
 R1.27 is a requirement, not a defect. It is the only criterion in this spec that
 mandates a shortcoming, and it exists because the shortcoming is the lesson. It must
 not be "fixed" within this feature — doing so would remove the evidence that
-motivates spec 003.
+motivates spec 004.

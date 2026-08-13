@@ -284,13 +284,13 @@ wrong with the data.
 
 This is the point of the whole feature: **a committed offset is a position, not a
 memory.** And note the consumer cannot tell its own amnesia from a real producer bug —
-that ambiguity is why durable state matters, and spec 003 fixes it.
+that ambiguity is why durable state matters, and spec 004 fixes it.
 
 **T30 — replay from zero.** A fresh `CONSUMER_GROUP_ID` re-read all 1320 records from
 earliest and the totals came back correct. This genuinely works, and it breaks for
 exactly two reasons: startup cost grows with the topic, and `retention.ms` eventually
-deletes the inputs you would need to re-fold. Hence compaction (006) and durable
-state (003).
+deletes the inputs you would need to re-fold. Hence compaction (007) and durable
+state (004).
 
 **T31 / T32 — failing loudly.** Producing to a missing topic gives a named error, not
 silent auto-creation. With the broker stopped the endpoint returns `504` and reports
@@ -304,9 +304,72 @@ Visible in `kafka-consumer-groups.sh --describe` and in Kafka UI at `localhost:8
 
 | Gap | Closed by |
 |---|---|
-| Folded state lost on consumer restart (R1.27) | 003 |
+| Folded state lost on consumer restart (R1.27) | 004 |
 | Producer sequence counters lost on restart | accepted |
-| Duplicate processing after a crash (at-least-once) | 003, 008 |
-| Single broker, RF 1, no failover | 004 |
+| Duplicate processing after a crash (at-least-once) | 004, 009 |
+| Single broker, RF 1, no failover | 005 |
 
-Do not "fix" the first one inside 001 — it is the evidence that motivates 003.
+Do not "fix" the first one inside 001 — it is the evidence that motivates 004.
+
+---
+
+# Spec 002 — Prepaid Order Service
+
+**001 shows how Kafka orders messages. 002 shows how services are wired around it.**
+
+A prepaid order is placed in one HTTP call; the service records it and publishes
+`ORDER_CREATED` to `order-lifecycle` (3 partitions, keyed by `order_id`). Three
+services — inventory, notification, analytics — each consume that event **in their own
+consumer group**, so all three see every message. The order is then advanced through
+`PACKED → SHIPPED → DELIVERED`, one event at a time, each fanning out again.
+
+Read [docs/order-flow.md](docs/order-flow.md) first — it is one page and covers the
+whole flow with runnable commands. Full spec in
+[specs/002-prepaid-order-service/](specs/002-prepaid-order-service/requirements.md).
+
+Two things it adds that 001 cannot show:
+
+- **The synchronous/asynchronous boundary.** `POST /orders` blocks because the caller
+  needs an `order_id` back. Everything downstream of the event does not, and happens
+  off the log.
+- **Fan-out by consumer group.** One topic, three group ids, three independent
+  offsets. Spec 003 does the opposite — extra consumers in *one* group, where the
+  messages divide instead of duplicating.
+
+## Running it
+
+```bash
+docker compose up -d --build            # broker + 001 + 002
+./scripts/create_topics.sh              # creates order-events AND order-lifecycle
+docker compose logs -f inventory-consumer notification-consumer analytics-consumer
+```
+
+From the host instead, four terminals:
+
+```bash
+.venv/bin/python -m order_service.producer.app                        # :8010
+SERVICE_NAME=inventory    .venv/bin/python -m order_service.consumer.main
+SERVICE_NAME=notification .venv/bin/python -m order_service.consumer.main
+SERVICE_NAME=analytics    .venv/bin/python -m order_service.consumer.main
+```
+
+| Endpoint (`:8010`) | Purpose |
+|---|---|
+| `POST /orders` | create a prepaid order; `422` if the payment ≠ the item sum |
+| `POST /orders/{order_id}/events` | advance it; `409` if the transition is illegal |
+| `GET /orders/{order_id}` | the service's own record of the order |
+
+The order service **guards its own lifecycle** — asking for `SHIPPED` on an unpacked
+order is a `409`, not a message on a topic. Pass `"force": true` to bypass the guard
+and put a genuinely out-of-order event on the log; all three services will report an
+`ILLEGAL_TRANSITION` violation with no accompanying sequence gap.
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| Orders held in memory — a restart forgets them | accepted (a real service uses a database) |
+| No transactional outbox, so the record and the event cannot be atomic | out of scope; explained in the flow doc |
+| Consumer fold state lost on restart | 004 |
+| Duplicate processing after a crash (at-least-once) | 004, 009 |
+| No deduplication, though every event carries an `event_id` | 004, 009 |
