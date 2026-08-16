@@ -55,12 +55,16 @@ for dir in "${features[@]}"; do
     continue
   fi
 
+  # comm requires its inputs in the collating order of plain `sort`, not the version
+  # order above: -V puts R2.2 before R2.10, plain sort does the reverse. Feeding it
+  # -V-sorted lists makes it warn and, worse, silently miss differences past the first
+  # disorder — so the set arithmetic sorts plainly and only the display re-sorts by -V.
   mapfile -t uncovered < <(comm -23 \
-    <(printf '%s\n' "${declared[@]}") \
-    <(printf '%s\n' "${cited[@]:-}"))
+    <(printf '%s\n' "${declared[@]}" | sort) \
+    <(printf '%s\n' "${cited[@]:-}" | sort) | sort -V)
   mapfile -t unknown < <(comm -13 \
-    <(printf '%s\n' "${declared[@]}") \
-    <(printf '%s\n' "${cited[@]:-}"))
+    <(printf '%s\n' "${declared[@]}" | sort) \
+    <(printf '%s\n' "${cited[@]:-}" | sort) | sort -V)
 
   # A task is "- [ ] **T<n>** …" plus its wrapped continuation lines, so the
   # citation is looked for across the whole block, not just the first line.
