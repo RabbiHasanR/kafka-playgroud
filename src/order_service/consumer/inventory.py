@@ -41,7 +41,7 @@ def _release_reservation(event: LifecycleEvent) -> None:
 
 
 def build_service() -> ServiceSpec:
-    """Build the inventory service spec: ``ORDER_CREATED`` and ``SHIPPED`` only."""
+    """Build the inventory service spec."""
     handlers: dict[EventType, Handler] = {
         EventType.ORDER_CREATED: _reserve_stock,
         EventType.SHIPPED: _release_reservation,

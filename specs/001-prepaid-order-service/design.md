@@ -150,9 +150,11 @@ others, because their offsets were never shared.
 ### D8 — One consume runtime, three handler maps — *R1.33, R1.34, R1.35, R1.37*
 
 `consumer/runtime.py` owns the only poll/decode/detect/dispatch/commit loop. A service
-is data, not code: a `ServiceSpec` carrying a default group id and a
-`dict[EventType, Handler]`. `SERVICE_NAME` selects one from a registry at startup, so
-all three run from one image and one entry point.
+is data, not code: a `ServiceSpec` carrying a name and a `dict[EventType, Handler]`.
+The group id is not on the spec — it is derived from the name by `Settings.group_id_for`
+and overridable from the environment (D12), which keeps the spec free of configuration.
+`SERVICE_NAME` selects one from a registry at startup, so all three run from one image
+and one entry point.
 
 Three near-identical consume loops is the obvious wrong turn — the third copy is where
 the offset-commit bug always gets fixed in two places and not the third.

@@ -7,9 +7,9 @@ from one image and one entry point (D8, R1.37).
 Each service is its own consumer group (D7). Kafka tracks an offset per group, so all
 three read every message and stopping one cannot affect the others.
 
-Offsets are committed after the handler returns, never before (R1.32) — at-least-once
-delivery. The fold is in-memory and lost on restart, so a post-restart sequence-gap
-violation is indistinguishable from a real one (X3).
+Offsets commit after the handler returns (R1.32), so delivery is at-least-once. The
+fold is in-memory and lost on restart, so a post-restart sequence-gap violation is
+indistinguishable from a real one (X3).
 """
 
 import json
@@ -32,8 +32,7 @@ from order_service.events import (
 
 logger = logging.getLogger(__name__)
 
-#: What a service does with one event. Handlers log and return nothing; raising is not
-#: part of the contract at this spec.
+#: Raising is not part of the handler contract at this spec.
 Handler = Callable[[LifecycleEvent], None]
 
 
@@ -41,10 +40,7 @@ Handler = Callable[[LifecycleEvent], None]
 class ServiceSpec:
     """One consumer service (R1.28, R1.37).
 
-    Attributes:
-        name: Short service name, used in logs and to derive the group id.
-        handlers: Which event types this service reacts to. Types absent from the map
-            are skipped without error (R1.33).
+    Event types absent from ``handlers`` are skipped without error (R1.33).
     """
 
     name: str
@@ -90,13 +86,8 @@ def apply_event(
 ) -> tuple[OrderFold, list[Violation]]:
     """Fold one event into a service's view of an order, reporting violations.
 
-    Pure, so the state can later be re-hosted on a durable store by changing only
-    where it comes from and goes to. The event is applied even when it violates an
-    expectation, so consumption continues (R1.40).
-
-    Args:
-        current: The service's existing fold for this order, or ``None`` if unseen.
-        event: The event to apply.
+    The event is applied even when it violates an expectation, so consumption
+    continues (R1.40).
 
     Returns:
         The updated fold and the violations this event triggered.

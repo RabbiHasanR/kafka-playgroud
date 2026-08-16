@@ -1,7 +1,6 @@
 """The notification service.
 
-Reacts to all four event types (R1.34). One handler serves every type, with the
-wording chosen from :data:`MESSAGES`.
+Reacts to all four event types (R1.34).
 """
 
 import logging
@@ -13,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "notification"
 
-#: What the customer is told for each lifecycle event.
 MESSAGES: dict[EventType, str] = {
     EventType.ORDER_CREATED: "Order confirmed — payment received, we are preparing it",
     EventType.PACKED: "Your order is packed and waiting for pickup",
@@ -45,7 +43,7 @@ def _notify(event: LifecycleEvent) -> None:
 
 
 def build_service() -> ServiceSpec:
-    """Build the notification service spec, handling all four event types."""
+    """Build the notification service spec."""
     handlers: dict[EventType, Handler] = {
         event_type: _notify for event_type in EventType
     }
