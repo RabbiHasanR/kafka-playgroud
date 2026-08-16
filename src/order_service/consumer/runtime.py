@@ -14,11 +14,18 @@ indistinguishable from a real one (X3).
 
 import json
 import logging
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
-from confluent_kafka import Consumer, KafkaError, KafkaException, Message
+from confluent_kafka import (
+    Consumer,
+    KafkaError,
+    KafkaException,
+    Message,
+    TopicPartition,
+)
 
 from order_service.config import GroupProtocol, Settings
 from order_service.events import (
@@ -268,7 +275,10 @@ class ServiceConsumer:
         self._settings = settings
         self._group_id = settings.group_id_for(spec.name)
         self._instance = settings.instance_label
-        self._folds: dict[str, OrderFold] = {}
+        # Partition first, then order (D6). An instance holds state for exactly the
+        # partitions it owns, so a revocation is one `del` and the shape of the data
+        # structure says what co-partitioned state means.
+        self._folds: dict[int, dict[str, OrderFold]] = {}
         self._running = False
         self._consumer = Consumer(
             build_consumer_config(
@@ -299,7 +309,16 @@ class ServiceConsumer:
             KafkaException: If the broker reports a fatal error.
         """
         topic = self._settings.order_lifecycle_topic
-        self._consumer.subscribe([topic])
+        # D5 — the callbacks log and manage folds; none of them assigns. Leaving the
+        # assignment to the client is what keeps one callback body correct under eager,
+        # cooperative, and KIP-848 alike, and it is what makes each partition resume
+        # from the group's last committed offset (R2.16).
+        self._consumer.subscribe(
+            [topic],
+            on_assign=self._on_assign,
+            on_revoke=self._on_revoke,
+            on_lost=self._on_lost,
+        )
         self._running = True
         # R2.22 — protocol and assignor in the banner, so a log excerpt pasted into a
         # result carries the configuration it was produced under.
@@ -336,6 +355,54 @@ class ServiceConsumer:
             self._consumer.close()
             logger.info("[%s] consumer closed", self._spec.name)
 
+    # -- rebalance callbacks (D5) ---------------------------------------------------
+    # Logged at WARNING rather than INFO because R2.9 asks for a severity that separates
+    # them from ordinary record processing, and every consumed record is an INFO line.
+    # A rebalance is not an error; it is the one operational event worth interrupting
+    # the stream to notice.
+
+    def _on_assign(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        """Log partitions gained. Does not assign — the client does (D5)."""
+        self._log_membership("ASSIGNED", partitions)
+
+    def _on_revoke(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        """Log partitions given up and discard exactly their folds (R2.14)."""
+        self._log_membership("REVOKED", partitions)
+        self._drop_folds(partitions)
+
+    def _on_lost(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        """Log partitions lost to an eviction and discard exactly their folds.
+
+        Separate from ``_on_revoke`` because these partitions may already belong to
+        another member, so committing against them fails — which is what makes the
+        eviction experiment readable.
+        """
+        self._log_membership("LOST", partitions)
+        self._drop_folds(partitions)
+
+    def _log_membership(self, event: str, partitions: list[TopicPartition]) -> None:
+        """Log one membership change with a stable marker (R2.9, R2.10)."""
+        changed = sorted(tp.partition for tp in partitions)
+        logger.warning(
+            "[%s/%s] REBALANCE %s partitions=%s held=%s",
+            self._spec.name,
+            self._instance,
+            event,
+            changed or "[]",
+            sorted(self._folds) or "[]",
+        )
+
+    def _drop_folds(self, partitions: list[TopicPartition]) -> None:
+        """Forget the folded state for exactly these partitions (R2.14, D6).
+
+        The partitions this member keeps retain theirs. Whoever receives these next
+        starts with no memory of the orders on them, which is what produces R2.15's
+        sequence-gap violations — the same amnesia 001 saw on restart, now caused by
+        routine scaling. Not to be "fixed" here (D7).
+        """
+        for partition in {tp.partition for tp in partitions}:
+            self._folds.pop(partition, None)
+
     def _handle_error(self, message: Message) -> None:
         """Log a broker-reported error on a polled message.
 
@@ -347,7 +414,9 @@ class ServiceConsumer:
             return
         if error is not None and error.fatal():
             raise KafkaException(error)
-        logger.error("[%s] consume error: %s", self._spec.name, error)
+        logger.error(
+            "[%s/%s] consume error: %s", self._spec.name, self._instance, error
+        )
 
     def _handle_message(self, message: Message) -> None:
         """Decode, detect, dispatch, and commit one message.
@@ -357,25 +426,29 @@ class ServiceConsumer:
         """
         raw = message.value()
         key = message.key()
+        partition = message.partition()
         try:
             event = LifecycleEvent.model_validate(json.loads(raw.decode("utf-8")))
         except (ValueError, UnicodeDecodeError) as exc:
             logger.error(
-                "[%s] undecodable message at %s[%d]@%d: %s",
+                "[%s/%s] undecodable message at %s[%d]@%d: %s",
                 self._spec.name,
+                self._instance,
                 message.topic(),
-                message.partition(),
+                partition,
                 message.offset(),
                 exc,
             )
-            self._consumer.commit(message=message, asynchronous=False)
+            self._commit(message)
             return
 
-        # R1.42 — service name first so three interleaved log streams stay readable.
+        # R1.42 and R2.8 — service name and instance first, so three interleaved log
+        # streams from one group stay readable by filtering alone.
         logger.info(
-            "[%s] partition=%d offset=%d key=%s order_id=%s seq=%d type=%s",
+            "[%s/%s] partition=%d offset=%d key=%s order_id=%s seq=%d type=%s",
             self._spec.name,
-            message.partition(),
+            self._instance,
+            partition,
             message.offset(),
             key.decode("utf-8") if key is not None else "<null>",
             event.order_id,
@@ -383,16 +456,20 @@ class ServiceConsumer:
             event.event_type,
         )
 
-        updated, violations = apply_event(self._folds.get(event.order_id), event)
-        self._folds[event.order_id] = updated
+        # D6 — the fold lives under the partition it arrived on, so it goes away with
+        # that partition and no other.
+        by_order = self._folds.setdefault(partition, {})
+        updated, violations = apply_event(by_order.get(event.order_id), event)
+        by_order[event.order_id] = updated
         for violation in violations:
             # R1.41 — WARNING and a stable marker, so `grep VIOLATION` is the whole
             # filtering story.
             logger.warning(
-                "[%s] %s partition=%d offset=%d",
+                "[%s/%s] %s partition=%d offset=%d",
                 self._spec.name,
+                self._instance,
                 violation.as_log_fields(),
-                message.partition(),
+                partition,
                 message.offset(),
             )
 
@@ -400,5 +477,33 @@ class ServiceConsumer:
         if handler is not None:
             handler(event)
 
+        # R2.23 — the eviction lever (D9). Placed after the handler and before the
+        # commit on purpose: a member that sleeps past `max.poll.interval.ms` is thrown
+        # out of the group here, so the commit below is the one that fails.
+        if self._settings.handler_delay_seconds > 0:
+            time.sleep(self._settings.handler_delay_seconds)
+
         # R1.32 — only now, after the handler has run.
-        self._consumer.commit(message=message, asynchronous=False)
+        self._commit(message)
+
+    def _commit(self, message: Message) -> None:
+        """Commit one offset, surviving the loss of the partition it belongs to.
+
+        Under scale-out this can fail for a reason 001 could not produce: the member was
+        evicted or the partition was revoked mid-handler, so the offset is somebody
+        else's now. That is logged under its own marker — deliberately not 001's
+        ``VIOLATION``, which means "the data was wrong" rather than "our membership
+        changed underneath us" — and consumption continues so the member rejoins
+        (R2.26, R2.27, D8).
+        """
+        try:
+            self._consumer.commit(message=message, asynchronous=False)
+        except KafkaException as exc:
+            logger.warning(
+                "[%s/%s] COMMIT_REJECTED partition=%d offset=%d reason=%s",
+                self._spec.name,
+                self._instance,
+                message.partition(),
+                message.offset(),
+                exc.args[0] if exc.args else exc,
+            )

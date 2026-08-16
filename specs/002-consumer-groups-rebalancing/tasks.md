@@ -38,33 +38,33 @@ runtime before the config builder means writing the consume loop twice.
 
 ## Runtime — membership and state
 
-- [ ] **T5** — Add `on_assign`, `on_revoke`, and `on_lost` to `subscribe()`. Each logs its
+- [x] **T5** — Add `on_assign`, `on_revoke`, and `on_lost` to `subscribe()`. Each logs its
   partition list with a stable marker, with revocation and loss distinguishable from
   assignment and from each other. **None of them calls `assign()`, `unassign()`,
   `incremental_assign()`, or `incremental_unassign()`** — the client applies the correct
   default for whichever protocol and assignor is in force, which is what keeps one callback
   body valid across all four combinations and what makes each partition resume from the
   group's last committed offset. — *R2.9, R2.10, R2.16* — D5
-- [ ] **T6** — Re-key the fold store from `dict[str, OrderFold]` to
+- [x] **T6** — Re-key the fold store from `dict[str, OrderFold]` to
   `dict[int, dict[str, OrderFold]]`, partition first. Drop exactly the revoked or lost
   partitions' folds in the callbacks and retain the rest, and let a partition arriving
   without a fold produce the ordinary sequence-gap violations 001 already detects, rather
   than suppressing them. — *R2.14, R2.15* — D6, D7
-- [ ] **T7** — Add the instance identity to every consumed-record log line, alongside the
+- [x] **T7** — Add the instance identity to every consumed-record log line, alongside the
   service name and record coordinates 001's logging requirement already puts there, so
   three interleaved streams from one group can be separated by filtering alone.
   — *R2.8* — D3
-- [ ] **T8** — Apply the handler delay per event, after the handler returns and before the
+- [x] **T8** — Apply the handler delay per event, after the handler returns and before the
   commit, so that a delayed handler holds up the poll loop exactly as a slow real handler
   would. — *R2.23* — D9
-- [ ] **T9** — Guard the offset commit: catch the failure raised when the member no longer
+- [x] **T9** — Guard the offset commit: catch the failure raised when the member no longer
   owns the partition, log it at `WARNING` with a stable marker **distinct from** 001's
   `VIOLATION` marker, and continue polling so the member rejoins rather than exiting.
   — *R2.26, R2.27* — D8
 
 ## Wiring
 
-- [ ] **T10** — Replace `notification-consumer` in `docker-compose.yml` with
+- [x] **T10** — Replace `notification-consumer` in `docker-compose.yml` with
   `notification-consumer-1`, `-2`, and `-3` generated from one YAML anchor, sharing a group
   id and each carrying its own `CONSUMER_INSTANCE_ID`. Put `-2` and `-3` behind a
   `scale-out` profile so a plain `up` starts the group with one member and the others join

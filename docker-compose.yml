@@ -1,3 +1,22 @@
+# The three notification instances differ only in their identity, so the rest is
+# written once (002 D2). `--scale` was rejected: it forbids container_name, so
+# there is no stable name to `docker restart`, and every replica would share one
+# environment block — which makes a distinct group.instance.id per instance
+# impossible and defeats static membership outright.
+x-notification-consumer: &notification-consumer
+  build: .
+  command: python -m order_service.consumer.main
+  depends_on:
+    kafka:
+      condition: service_healthy
+
+x-notification-env: &notification-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+  ORDER_LIFECYCLE_TOPIC: order-lifecycle
+  SERVICE_NAME: notification
+  # One group id across all three — this is the whole feature.
+  CONSUMER_GROUP_ID: notification-service
+
 services:
   kafka:
     image: apache/kafka:4.3.1
@@ -98,18 +117,44 @@ services:
       kafka:
         condition: service_healthy
 
-  notification-consumer:
-    build: .
-    container_name: notification-consumer
-    command: python -m order_service.consumer.main
+  # --- spec 002: notification scales out ----------------------------------
+  # Three instances, ONE group id. The three partitions divide between them, so
+  # each event is handled by exactly one — the inverse of the fan-out above,
+  # running on the same topic at the same time. Inventory and analytics stay at
+  # one instance each and are the control: they keep seeing every event.
+  #
+  # Only -1 starts by default. Bring the others in while watching the logs:
+  #   docker compose --profile scale-out up -d
+  #
+  # STATIC_MEMBERSHIP=1 gives each instance a stable group.instance.id, so a
+  # restart returns it to its own partitions instead of rebalancing the group.
+  # Unset, `${VAR:+x}` yields "" and the consumer reads that as dynamic.
+
+  notification-consumer-1:
+    <<: *notification-consumer
+    container_name: notification-consumer-1
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
-      ORDER_LIFECYCLE_TOPIC: order-lifecycle
-      SERVICE_NAME: notification
-      CONSUMER_GROUP_ID: notification-service
-    depends_on:
-      kafka:
-        condition: service_healthy
+      <<: *notification-env
+      CONSUMER_INSTANCE_ID: notification-1
+      CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
+
+  notification-consumer-2:
+    <<: *notification-consumer
+    container_name: notification-consumer-2
+    profiles: ["scale-out"]
+    environment:
+      <<: *notification-env
+      CONSUMER_INSTANCE_ID: notification-2
+      CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
+
+  notification-consumer-3:
+    <<: *notification-consumer
+    container_name: notification-consumer-3
+    profiles: ["scale-out"]
+    environment:
+      <<: *notification-env
+      CONSUMER_INSTANCE_ID: notification-3
+      CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
   analytics-consumer:
     build: .
