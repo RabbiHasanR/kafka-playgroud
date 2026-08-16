@@ -120,6 +120,12 @@ Each is run and observed, not merely coded. Tick only after actually running it.
 - [x] **T35** — **Sequence gap from amnesia.** Restart a consumer mid-order and confirm
   the next event raises a sequence-gap violation that is indistinguishable from a real
   producer-side gap: Kafka restored the position, nothing restored the fold. — *R1.38*
+- [x] **T39** — **Crash and resume.** `SIGKILL` a consumer so it never runs its
+  `close()`, publish while it is dead, then restart it and confirm the first offset it
+  logs is its own group's last committed offset — not the topic end, and not zero. A
+  fresh `CONSUMER_GROUP_ID` on the same container replays from zero, proving the resume
+  came from committed offsets rather than from `auto.offset.reset`. — *R1.31, R1.32* —
+  D10
 
 ## Documentation
 
@@ -133,6 +139,8 @@ Each is run and observed, not merely coded. Tick only after actually running it.
 
 Run on 2026-08-13 against the compose stack, all four services running. Re-run after
 the repository was reduced to this one feature (X8); numbers below are from that run.
+T39 was added and run later, on 2026-08-16, against a fresh broker volume — its offsets
+therefore start from 0 and do not line up with the rows above.
 
 | Task | Observed |
 |---|---|
@@ -145,6 +153,7 @@ the repository was reduced to this one feature (X8); numbers below are from that
 | T33 | 25 orders across 3 partitions (13/6/6); **zero** appeared on more than one partition |
 | T34 | With `notification-consumer` stopped, its group lagged 1 while the other two stayed at 0; on restart it caught up to 0 from its own committed offset |
 | T35 | That restart raised `SEQUENCE_GAP expected=1 observed=3` — Kafka restored the position, nothing restored the fold |
+| T39 | `docker kill -s SIGKILL inventory-consumer` exited 137 with **no** `consumer closed` line; 10 events published while it was dead left it frozen at its committed `2/2/4` (lag `4/4/2`) while notification and analytics stayed at lag 0; on restart it resumed at exactly `p0@2 p1@2 p2@4`, drained all 10, and returned to lag 0 with no duplicate and no violation. A throwaway container with `CONSUMER_GROUP_ID=inventory-replay-probe` started at `p2@0` instead |
 
 Inventory logging `PACKED` and `DELIVERED` at `INFO` while producing no handler output
 is T18 working, not a miss: it receives every event and reacts to two of them.
@@ -165,6 +174,17 @@ feature was removed from the repository (see X8), taking its requirement with it
 **T31 is the task that keeps this a Kafka feature.** Without `force`, the producer's
 own guard (T10, T12) would make T15 and T16 unreachable — a service that never emits an
 illegal transition gives the consumers nothing to detect.
+
+**T39 did not produce a duplicate, and that is not a refutation of D10.** The commit at
+`runtime.py` is synchronous and per message, so the window between a handler returning
+and its offset landing is microseconds wide; a `SIGKILL` timed by hand almost never
+falls inside it. The redelivery D10 describes stays real — it just needs fault
+injection, not a stopwatch, to observe on demand. Nothing here asks for that.
+
+**T39 saw no `SEQUENCE_GAP` either, which distinguishes it from T35.** The five orders
+published during the outage were new, so each began at sequence 1 and the rebuilt fold
+agreed with them. T35's gap needs an order the consumer had already partly folded
+before it lost its memory.
 
 **The order store is deliberately in memory (T9).** Restarting `order-service` forgets
 every order, so advancing a pre-restart order returns `404`. Do not "fix" this here; a

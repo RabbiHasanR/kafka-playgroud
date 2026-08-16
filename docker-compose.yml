@@ -66,9 +66,9 @@ services:
   # offset. Spec 002 does the opposite, adding a second consumer to one group
   # so the messages divide instead.
   #
-  # inventory and analytics sit behind the "later" profile, so a plain
-  # `docker compose up` runs the broker, the order service, and notification
-  # only. Bring the full fan-out up with `--profile later`.
+  # All three come up with a plain `docker compose up` — the fan-out is only
+  # visible when every group is reading, and T34/T39 need the other two running
+  # to show that stopping one leaves them untouched.
 
   order-service:
     build: .
@@ -88,7 +88,6 @@ services:
   inventory-consumer:
     build: .
     container_name: inventory-consumer
-    profiles: ["later"]
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
@@ -115,7 +114,6 @@ services:
   analytics-consumer:
     build: .
     container_name: analytics-consumer
-    profiles: ["later"]
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
