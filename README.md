@@ -218,6 +218,26 @@ SERVICE_NAME=analytics    .venv/bin/python -m order_service.consumer.main
 | `POST /orders/{order_id}/events` | advance it; `409` if the transition is illegal |
 | `GET /orders/{order_id}` | the service's own record of the order |
 
+Advancing one order through the chain, with `ORDER` holding the id `POST /orders`
+returned. Watch the three consumer logs between each call — every one of them sees
+every event, and they land on the same partition because the key is the `order_id`:
+
+```bash
+curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
+  -d '{"event_type":"PACKED"}'
+
+curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
+  -d '{"event_type":"SHIPPED","payload":{"carrier":"Pathao","tracking_number":"PT-1"}}'
+
+curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
+  -d '{"event_type":"DELIVERED"}'
+
+curl -s localhost:8010/orders/$ORDER
+```
+
+The full walkthrough, including the failure cases, is in
+[docs/order-flow.md](docs/order-flow.md).
+
 The order service **guards its own lifecycle** — asking for `SHIPPED` on an unpacked
 order is a `409`, not a message on a topic. Pass `"force": true` to bypass the guard
 and put a genuinely out-of-order event on the log; all three services will report an
