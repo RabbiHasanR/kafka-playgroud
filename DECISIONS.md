@@ -279,3 +279,53 @@ record of which way it went. Also rejected: keeping `specs/001-order-event-pipel
 as documentation with its code deleted, which would leave three spec documents and 33
 ticked tasks describing software that does not exist. Git history at `2ac63da` has all
 of it if it is ever wanted back.
+
+---
+
+## X9 — Both rebalance protocols are exercised; `classic` stays the default
+
+**Date:** 2026-08-16 **Status:** accepted **Specs:** 002+
+
+**Context.** Kafka 4.x ships two consumer group protocols. In the **classic** protocol the
+coordinator elects one *client* as group leader, and that client computes the partition
+assignment and uploads it for every member. Under **KIP-848** (`group.protocol=consumer`,
+GA in Kafka 4.0) the *broker* computes the assignment and pushes each member its own
+share.
+
+This is not a per-feature choice. Every consumer from 002 to 008 inherits whichever
+default is set, and the two protocols accept partly disjoint client configuration —
+`partition.assignment.strategy` versus `group.remote.assignor`, and client-side versus
+broker-side session timeouts. A default chosen here propagates through every later spec's
+consumer config.
+
+The environment already supports both without modification: the broker runs
+`KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer` (spec 000), and the
+installed client is confluent-kafka/librdkafka 2.15.0.
+
+**Decision.** Spec 002 exercises **both**, selected by `CONSUMER_GROUP_PROTOCOL`, and
+**`classic` remains the default**.
+
+**Consequences.** The same scale-out experiment runs twice, one environment variable
+apart, which is what makes "the new protocol avoids the stop-the-world rebalance" an
+observation rather than a claim. Keeping `classic` as the default preserves two things
+that would otherwise be invalidated without either of them changing: 001's recorded
+experiment results in its `tasks.md`, and the whole of
+`docs/concurrency-and-confluent-kafka.md` §10, which describes JoinGroup/SyncGroup and
+states in bold that a client computes the assignment. That section is amended by 002 to
+scope its claim to the classic protocol rather than being deleted.
+
+The cost is that this repository's default is the protocol Kafka is moving away from. That
+is accepted for now on the grounds that the ladder's purpose is to *understand* the
+mechanism, and the classic protocol is the one whose failure modes — stop-the-world
+revocation, client-side assignors, eager versus cooperative — motivate the redesign.
+
+**When this should flip.** When a later spec's consumers no longer need the classic
+failure modes to make their point, or when librdkafka's default itself changes. Flipping
+it means a new entry superseding this one, plus a re-run of 001's T27–T39 and 002's
+experiments, since both files record protocol-dependent observations.
+
+**Rejected.** Defaulting to `consumer` immediately — more modern and where the ecosystem
+is going, but it silently invalidates 001's recorded results and one of this repository's
+two reference documents. Also rejected: `classic` only, which would leave the environment's
+own `classic,consumer` broker setting unexplained and teach a protocol that Kafka 4.x is
+deprecating, with no sight of its replacement.
