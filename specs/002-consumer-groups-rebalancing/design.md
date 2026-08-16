@@ -117,7 +117,7 @@ readable logs without also changing the group's rebalance semantics.
 ### D4 — The protocol switch is validated by us, because librdkafka only guards one direction — *R2.17, R2.19, R2.20, R2.21, R2.22*
 
 `CONSUMER_GROUP_PROTOCOL` selects `classic` or `consumer`, and
-`_build_consumer_config()` assembles a different config dict for each. This is not
+`build_consumer_config()` assembles a different config dict for each. This is not
 cosmetic plumbing: the two protocols accept **different, partly disjoint** settings.
 Probed against 2.15.0:
 
@@ -347,7 +347,7 @@ Every setting defaults to 001's behaviour (R2.34).
 |---|---|---|
 | `CONSUMER_INSTANCE_ID` | hostname | log prefix only (D3) |
 | `CONSUMER_GROUP_PROTOCOL` | `classic` | `classic` \| `consumer` (D4, X9) |
-| `CONSUMER_ASSIGNMENT_STRATEGY` | `range` | classic only: `range` \| `roundrobin` \| `cooperative-sticky` |
+| `CONSUMER_ASSIGNMENT_STRATEGY` | unset → client default (`range`) | classic only: `range` \| `roundrobin` \| `cooperative-sticky` |
 | `CONSUMER_REMOTE_ASSIGNOR` | unset | KIP-848 only: `uniform` \| `range` |
 | `CONSUMER_SESSION_TIMEOUT_MS` | unset → client default | classic only; must be ≤ max poll interval |
 | `CONSUMER_MAX_POLL_INTERVAL_MS` | unset → client default | both protocols (D9) |

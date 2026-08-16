@@ -17,7 +17,11 @@ from confluent_kafka import KafkaException
 
 from order_service.config import get_settings
 from order_service.consumer import analytics, inventory, notification
-from order_service.consumer.runtime import ServiceConsumer, ServiceSpec
+from order_service.consumer.runtime import (
+    ConsumerConfigError,
+    ServiceConsumer,
+    ServiceSpec,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +64,14 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(2)
 
-    consumer = ServiceConsumer(spec, settings)
+    # R2.21 — an incompatible protocol/setting pair is a configuration error, so it
+    # exits like an unknown SERVICE_NAME does: immediately, without joining the group.
+    # Restarting will not help either of them.
+    try:
+        consumer = ServiceConsumer(spec, settings)
+    except ConsumerConfigError as exc:
+        logger.error("[%s] %s", spec.name, exc)
+        sys.exit(2)
 
     def shutdown(signum: int, _frame: FrameType | None) -> None:
         logger.info("[%s] signal %d received, shutting down", spec.name, signum)

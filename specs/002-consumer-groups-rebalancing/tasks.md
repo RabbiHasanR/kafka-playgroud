@@ -11,7 +11,7 @@ runtime before the config builder means writing the consume loop twice.
 
 ## Configuration and the protocol switch
 
-- [ ] **T1** — Extend `Settings` in `config.py` with `consumer_instance_id` (defaulting to
+- [x] **T1** — Extend `Settings` in `config.py` with `consumer_instance_id` (defaulting to
   the hostname), `consumer_group_protocol` (defaulting to `classic`),
   `consumer_assignment_strategy`, `consumer_remote_assignor`,
   `consumer_session_timeout_ms`, `consumer_max_poll_interval_ms`, `handler_delay_seconds`
@@ -19,20 +19,20 @@ runtime before the config builder means writing the consume loop twice.
   string as unset, because Compose interpolation yields `""` rather than removing the
   variable. Every default must leave 001's behaviour unchanged.
   — *R2.7, R2.17, R2.18, R2.23, R2.24, R2.28, R2.34* — D3, D4, D9, D10
-- [ ] **T2** — Implement `_build_consumer_config()` in `runtime.py`, branching on the
+- [x] **T2** — Implement `_build_consumer_config()` in `runtime.py`, branching on the
   protocol: `classic` sends `partition.assignment.strategy` and, when set,
   `session.timeout.ms`; `consumer` sends `group.remote.assignor` and **never** sends
   `session.timeout.ms` or `heartbeat.interval.ms`, which librdkafka rejects as broker-side.
   Both send `group.instance.id` when static membership is on and
   `max.poll.interval.ms` when set. — *R2.19, R2.20, R2.30* — D4, D10
-- [ ] **T3** — Validate the protocol/setting combination before constructing the
+- [x] **T3** — Validate the protocol/setting combination before constructing the
   `Consumer`, and fail with an error naming both the offending setting and the selected
   protocol. This must at minimum catch `CONSUMER_REMOTE_ASSIGNOR` under `classic` and
   `CONSUMER_ASSIGNMENT_STRATEGY` under `consumer` — librdkafka rejects only the second,
   and silently ignores the first, which would make an experiment report on an assignor
   that was never in effect. Exit non-zero without joining the group.
   — *R2.21* — D4
-- [ ] **T4** — Log the instance identity, the protocol, and the assignor actually in force
+- [x] **T4** — Log the instance identity, the protocol, and the assignor actually in force
   in the startup banner, so a log excerpt pasted into a result carries its own
   configuration. — *R2.22* — D3, D4
 

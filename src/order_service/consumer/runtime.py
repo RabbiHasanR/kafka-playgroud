@@ -20,7 +20,7 @@ from enum import StrEnum
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message
 
-from order_service.config import Settings
+from order_service.config import GroupProtocol, Settings
 from order_service.events import (
     EXPECTED_NEXT_EVENT,
     RESULTING_STATE,
@@ -34,6 +34,124 @@ logger = logging.getLogger(__name__)
 
 #: Raising is not part of the handler contract at this spec.
 Handler = Callable[[LifecycleEvent], None]
+
+#: What each protocol uses when the corresponding setting is left unset. Reported in
+#: the startup banner (R2.22) so a log excerpt carries its own configuration.
+DEFAULT_ASSIGNOR = {
+    GroupProtocol.CLASSIC: "range (client default)",
+    GroupProtocol.CONSUMER: "uniform (broker default)",
+}
+
+
+class ConsumerConfigError(ValueError):
+    """A consumer configuration the selected group protocol cannot accept (R2.21)."""
+
+
+def validate_protocol_settings(settings: Settings) -> None:
+    """Reject settings the selected group protocol does not accept (R2.21).
+
+    librdkafka guards only one of the two directions. It raises ``_INVALID_ARG`` for a
+    classic-only setting under ``group.protocol=consumer``, but **silently accepts and
+    ignores** ``group.remote.assignor`` under ``classic`` — so a run configured with an
+    assignor that never took effect would start cleanly and produce an observation about
+    something that was not happening. In a repository whose output is observations, that
+    is the worst available failure, so both directions are checked here (D4).
+
+    Raises:
+        ConsumerConfigError: If a setting is incompatible with the selected protocol.
+    """
+    protocol = settings.consumer_group_protocol
+
+    # Each entry is the offending value and the remedy for that specific setting —
+    # the two rejected under KIP-848 have different answers, and one hint for both
+    # would be wrong for whichever it was not written about.
+    if protocol is GroupProtocol.CONSUMER:
+        incompatible = {
+            "CONSUMER_ASSIGNMENT_STRATEGY": (
+                settings.consumer_assignment_strategy,
+                "use CONSUMER_REMOTE_ASSIGNOR",
+            ),
+            "CONSUMER_SESSION_TIMEOUT_MS": (
+                settings.consumer_session_timeout_ms,
+                "the session timeout is broker-side under this protocol",
+            ),
+        }
+    else:
+        incompatible = {
+            "CONSUMER_REMOTE_ASSIGNOR": (
+                settings.consumer_remote_assignor,
+                "use CONSUMER_ASSIGNMENT_STRATEGY",
+            ),
+        }
+
+    problems = [
+        f"{name} cannot be used with CONSUMER_GROUP_PROTOCOL={protocol} — {remedy}"
+        for name, (value, remedy) in sorted(incompatible.items())
+        if value is not None
+    ]
+    if problems:
+        raise ConsumerConfigError("; ".join(problems))
+
+
+def assignor_in_effect(settings: Settings) -> str:
+    """Return the assignor actually in force, for the startup banner (R2.22)."""
+    if settings.consumer_group_protocol is GroupProtocol.CLASSIC:
+        chosen = settings.consumer_assignment_strategy
+    else:
+        chosen = settings.consumer_remote_assignor
+    return chosen or DEFAULT_ASSIGNOR[settings.consumer_group_protocol]
+
+
+def build_consumer_config(
+    settings: Settings, group_id: str, client_id: str
+) -> dict[str, object]:
+    """Assemble the librdkafka config for the selected group protocol (D4).
+
+    The two protocols take partly disjoint settings, so this is a branch rather than a
+    dict of values: ``partition.assignment.strategy`` and ``session.timeout.ms`` are
+    rejected under KIP-848, and ``group.remote.assignor`` does nothing under classic.
+    Anything left unset is omitted entirely so the client or broker default applies.
+
+    Raises:
+        ConsumerConfigError: If the settings are incompatible with the protocol.
+    """
+    validate_protocol_settings(settings)
+    protocol = settings.consumer_group_protocol
+
+    config: dict[str, object] = {
+        "bootstrap.servers": settings.kafka_bootstrap_servers,
+        # Its own group in 001 (fan-out, D7); in 002 the notification instances share
+        # one, and the same partitions divide between them instead.
+        "group.id": group_id,
+        # Committed by hand, after the handler runs (R1.32).
+        "enable.auto.commit": False,
+        # No committed offsets means start at the earliest retained message, so a fresh
+        # group id replays the whole topic.
+        "auto.offset.reset": "earliest",
+        "client.id": client_id,
+        "group.protocol": protocol.value,
+    }
+
+    if protocol is GroupProtocol.CLASSIC:
+        strategy = settings.consumer_assignment_strategy
+        if strategy is not None:
+            config["partition.assignment.strategy"] = strategy
+        if settings.consumer_session_timeout_ms is not None:
+            config["session.timeout.ms"] = settings.consumer_session_timeout_ms
+    elif settings.consumer_remote_assignor is not None:
+        config["group.remote.assignor"] = settings.consumer_remote_assignor
+
+    # Accepted by both protocols. Lowering it is half the eviction lever (D9) — under
+    # classic the client also enforces max.poll.interval.ms >= session.timeout.ms, so
+    # the session timeout has to come down with it.
+    if settings.consumer_max_poll_interval_ms is not None:
+        config["max.poll.interval.ms"] = settings.consumer_max_poll_interval_ms
+
+    # Static membership (D10), off unless an id is set. Accepted by both protocols.
+    if settings.consumer_instance_id_static is not None:
+        config["group.instance.id"] = settings.consumer_instance_id_static
+
+    return config
 
 
 @dataclass(frozen=True)
@@ -139,29 +257,36 @@ class ServiceConsumer:
     """Runs one service against the lifecycle topic."""
 
     def __init__(self, spec: ServiceSpec, settings: Settings) -> None:
+        """Build a consumer for one service.
+
+        Raises:
+            ConsumerConfigError: If the settings are incompatible with the selected
+                group protocol (R2.21) — raised before the client is constructed, so
+                the process never joins the group.
+        """
         self._spec = spec
         self._settings = settings
         self._group_id = settings.group_id_for(spec.name)
+        self._instance = settings.instance_label
         self._folds: dict[str, OrderFold] = {}
         self._running = False
         self._consumer = Consumer(
-            {
-                "bootstrap.servers": settings.kafka_bootstrap_servers,
-                # Its own group — fan-out rather than scale-out (D7).
-                "group.id": self._group_id,
-                # Committed by hand, after the handler runs (R1.32).
-                "enable.auto.commit": False,
-                # No committed offsets means start at the earliest retained message,
-                # so a fresh group id replays the whole topic.
-                "auto.offset.reset": "earliest",
-                "client.id": f"order-service-{spec.name}",
-            }
+            build_consumer_config(
+                settings,
+                group_id=self._group_id,
+                client_id=f"order-service-{spec.name}-{self._instance}",
+            )
         )
 
     @property
     def group_id(self) -> str:
         """Return the consumer group this service joined."""
         return self._group_id
+
+    @property
+    def instance(self) -> str:
+        """Return this process's identity within its group (R2.7)."""
+        return self._instance
 
     def stop(self) -> None:
         """Ask the consume loop to exit after the current iteration."""
@@ -176,13 +301,25 @@ class ServiceConsumer:
         topic = self._settings.order_lifecycle_topic
         self._consumer.subscribe([topic])
         self._running = True
+        # R2.22 — protocol and assignor in the banner, so a log excerpt pasted into a
+        # result carries the configuration it was produced under.
         logger.info(
-            "[%s] consuming topic=%s group=%s brokers=%s handling=%s",
+            "[%s/%s] consuming topic=%s group=%s brokers=%s handling=%s",
             self._spec.name,
+            self._instance,
             topic,
             self._group_id,
             self._settings.kafka_bootstrap_servers,
             ",".join(sorted(str(t) for t in self._spec.handlers)) or "<nothing>",
+        )
+        logger.info(
+            "[%s/%s] protocol=%s assignor=%s static_member=%s max_poll_interval_ms=%s",
+            self._spec.name,
+            self._instance,
+            self._settings.consumer_group_protocol,
+            assignor_in_effect(self._settings),
+            self._settings.consumer_instance_id_static or "<dynamic>",
+            self._settings.consumer_max_poll_interval_ms or "<client default>",
         )
 
         try:
