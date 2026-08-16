@@ -1,9 +1,15 @@
-# Threads, the event loop, and how confluent-kafka really sends
+# Threads, the event loop, and how confluent-kafka really sends and receives
 
-A short reference for the concurrency machinery this repo's producer sits on. Every
-concept is anchored to code in this repository, so read it with the files open.
+A short reference for the concurrency machinery this repo sits on. Every concept is
+anchored to code in this repository, so read it with the files open.
+
+**Part I (§1–7)** is the producer: a web service that is *called*, and publishes.
+**Part II (§8–14)** is the consumer: a bare process that *calls*, and reads. §2–4 are
+generic, and §15–16 recap both.
 
 ---
+
+> **PART I — THE PRODUCER**
 
 ## 1. The whole picture first
 
@@ -49,7 +55,7 @@ The part people miss: the GIL is **released** during I/O (socket reads, `sleep`)
 inside C extension code. That is the entire reason this works:
 
 ```python
-# src/order_service/producer/kafka_producer.py:81-83
+# src/order_service/producer/kafka_producer.py:62-64
 self._poll_thread = threading.Thread(
     target=self._poll_loop, name="order-service-poll", daemon=True
 )
@@ -66,14 +72,15 @@ explicitly in `stop()` instead, because we want `flush()` to happen first.
 Which is why this line matters:
 
 ```python
-# src/order_service/producer/orders.py:154
+# src/order_service/producer/orders.py:111
 self._orders: dict[str, Order] = {}
 ```
 
-This dict is process-local, and each `Order` carries its own `last_sequence`. Run two
-order-service processes and neither sees the other's orders; restart one and it hands
-out sequence 1 again for an order it has forgotten. That is **D5** plus the accepted
-in-memory limitation — deliberate, and the reason a restart loses orders.
+This dict is process-local, and each `Order` carries its own `last_sequence` (**D5** —
+the sequence lives on the order, not on the producer). Run two order-service processes
+and neither sees the other's orders; restart one and a pre-restart order is gone
+entirely, so advancing it returns `404`. Deliberate, and the reason a restart loses
+orders.
 
 | | shares memory | GIL | good for |
 |---|---|---|---|
@@ -122,7 +129,7 @@ The rule that follows:
 So this signature is a decision, not a typo:
 
 ```python
-# src/order_service/producer/routes.py:256-261
+# src/order_service/producer/routes.py:204-209
 @router.post("/orders/{order_id}/events", response_model=PublishEventResponse)
 def publish_event(                              # ← `def`, not `async def`
     order_id: str,
@@ -134,7 +141,7 @@ def publish_event(                              # ← `def`, not `async def`
 Because underneath it does this:
 
 ```python
-# src/order_service/producer/kafka_producer.py:158, 173
+# src/order_service/producer/kafka_producer.py:130, 145
 done = threading.Event()
 ...
 if not done.wait(wait):     # blocks the calling thread
@@ -151,7 +158,7 @@ result = await asyncio.to_thread(producer.publish_and_wait, event)
 ```
 
 …but `to_thread` just pushes the work onto the same threadpool. Same cost, extra
-indirection. D5 skipped it because nothing else in the handler is async.
+indirection. D6 skipped it because nothing else in the handler is async.
 
 ---
 
@@ -161,35 +168,36 @@ indirection. D5 skipped it because nothing else in the handler is async.
 **X1**). The Python objects are handles; the actual protocol work happens in C.
 
 ```python
-# src/order_service/producer/kafka_producer.py:59-70
+# src/order_service/producer/kafka_producer.py:42-51
 self._producer = Producer(
     {
         "bootstrap.servers": settings.kafka_bootstrap_servers,
         "acks": "all",
         "partitioner": "consistent_random",
-        "sticky.partitioning.linger.ms": 0,
-        "client.id": "order-pipeline-producer",
+        "client.id": "order-service-producer",
     }
 )
 ```
 
-**This constructor does not connect.** It builds config and starts librdkafka's own
-threads. What happens next, all in C, without any Python involvement:
+**This constructor does no network I/O on your thread, and never blocks.** It builds
+config and starts librdkafka's own threads. What happens next, all in C, without any
+Python involvement:
 
-1. An internal "main" thread contacts a `bootstrap.servers` address and fetches **cluster
-   metadata** — the full broker list, topics, partitions, and which broker leads each one.
-2. It opens a **dedicated thread and TCP connection per broker** it learned about.
+1. An internal `rdk:main` thread contacts a `bootstrap.servers` address, negotiates
+   protocol versions (**ApiVersions**), and fetches **cluster metadata** — the full
+   broker list, topics, partitions, and which broker leads each one.
+2. It opens a **dedicated thread and TCP connection per broker** it needs.
    Bootstrap is only a starting point; the client talks to leaders directly afterwards.
 3. Those threads handle batching, compression, retries, reconnects, and metadata refresh
-   on their own timers.
+   on their own timers (default every 5 minutes, plus on demand after a leader change).
 
-Because it is lazy and asynchronous, a wrong broker address does not raise at construction
-— it surfaces much later as a timeout. The one place we force a real round-trip:
+Because it is asynchronous, a wrong broker address does not raise at construction — it
+surfaces much later as a timeout. The one place we force a real round-trip:
 
 ```python
-# src/order_service/producer/kafka_producer.py:119-121
+# src/order_service/producer/kafka_producer.py:96-98
 metadata = self._producer.list_topics(timeout=timeout)
-topic = metadata.topics.get(self._settings.order_events_topic)
+topic = metadata.topics.get(self._settings.order_lifecycle_topic)
 return topic is not None and topic.error is None
 ```
 
@@ -201,10 +209,10 @@ it to distinguish "topic missing" from "broker unreachable".
 ## 6. The internal queue: why `produce()` returns instantly
 
 ```python
-# src/order_service/producer/kafka_producer.py:207-216
+# src/order_service/producer/kafka_producer.py:174-179
 self._producer.produce(
-    topic=self._settings.order_events_topic,
-    key=event.order_id.encode("utf-8") if keyed else None,
+    topic=self._settings.order_lifecycle_topic,
+    key=event.order_id.encode("utf-8"),
     value=event.model_dump_json().encode("utf-8"),
     on_delivery=on_delivery,
 )
@@ -219,7 +227,7 @@ Three consequences, each visible in the code:
 **(a) The queue is finite.** Produce faster than the network drains and it fills:
 
 ```python
-# src/order_service/producer/kafka_producer.py:214-215
+# src/order_service/producer/kafka_producer.py:180-181
 except BufferError as exc:
     raise DeliveryFailed(f"producer queue is full: {exc}") from exc
 ```
@@ -229,7 +237,7 @@ from its own C threads — it queues the delivery reports and hands them over on
 code asks. That is what this loop is for:
 
 ```python
-# src/order_service/producer/kafka_producer.py:123-126
+# src/order_service/producer/kafka_producer.py:100-103
 def _poll_loop(self) -> None:
     while not self._poll_stop.is_set():
         self._producer.poll(0.1)
@@ -240,7 +248,7 @@ its own thread so callbacks fire regardless of request traffic (decision **D6**)
 the app lifespan:
 
 ```python
-# src/order_service/producer/app.py:39-40, 55
+# src/order_service/producer/app.py:29-30, 45
 producer = LifecycleEventProducer(settings)
 producer.start()          # poll thread up before the first request
 ...
@@ -251,7 +259,7 @@ producer.stop()           # flush, then stop the thread
 the process:
 
 ```python
-# src/order_service/producer/kafka_producer.py:93
+# src/order_service/producer/kafka_producer.py:74
 remaining = self._producer.flush(flush_timeout)
 ```
 
@@ -284,7 +292,363 @@ that is the right trade when a human is holding the other end.
 
 ---
 
-## 8. Picking the right tool
+> **PART II — THE CONSUMER**
+
+## 8. The whole picture first, again
+
+The consumer is the same library with the arrows reversed — and one box fewer:
+
+```
+                  ┌──────────────── consumer process ────────────────┐
+                  │                                                  │
+                  │  [main thread]  ← the only Python thread         │
+                  │       │                                          │
+                  │       │  while self._running:                    │
+                  │       ▼                                          │
+                  │    poll(1.0) ──── pops one message ──┐           │
+                  │       │                              │           │
+                  │       ▼                              │           │
+                  │    handler(event)                    │           │
+                  │       │                              │           │
+                  │    commit() ─────────────────────────┼───────────┼──▶ Kafka
+                  │                                      │           │
+                  │                          [librdkafka fetch queue]│
+                  │                                      ▲           │
+                  │              [C broker threads] ─────┘           │
+                  │                    fetching continuously ◀───────┼─── records
+                  │              [rdk:main] heartbeats, rebalances   │
+                  └──────────────────────────────────────────────────┘
+```
+
+Compare with §1. **No event loop. No threadpool. No dedicated poll thread.** Three
+contexts instead of four: your main thread, `rdk:main`, and the broker threads.
+
+Everything below is [`ServiceConsumer`](../src/order_service/consumer/runtime.py#L147)
+and its entry point, [`main.py`](../src/order_service/consumer/main.py).
+
+---
+
+## 9. Why there is no FastAPI here
+
+The producer is **reactive**: nothing happens until someone calls it, so it needs a
+socket, a router, and status codes. The consumer is **proactive** — nobody calls it, it
+calls Kafka. Its entire life is one loop:
+
+```python
+# src/order_service/consumer/runtime.py:198-205
+while self._running:
+    message = self._consumer.poll(1.0)
+    if message is None:
+        continue
+    if message.error():
+        self._handle_error(message)
+        continue
+    self._handle_message(message)
+```
+
+No inbound socket, no request, no response. A web framework would add an event loop, an
+ASGI server, and a port binding around a `while` statement. **The broker is the
+consumer's web server**: consumer groups already provide work distribution (partition
+assignment), backpressure (you poll at your own pace), retry (uncommitted offsets are
+redelivered), and liveness (group membership).
+
+This also settles §7. The producer needs a *separate* poll thread because its Python
+thread is busy blocking in `done.wait()`. **The consumer's main loop already is the poll
+loop** — same requirement, satisfied by the structure rather than by an extra thread.
+
+| | producer | consumer |
+|---|---|---|
+| who initiates | an HTTP caller | this process |
+| Python threads | event loop + ~40 workers + poll thread | **one** |
+| who calls `poll()` | a dedicated background thread | the main loop itself |
+| lifecycle owner | FastAPI lifespan | `signal.signal` in `main()` |
+
+---
+
+## 10. What `subscribe()` really does
+
+```python
+# src/order_service/consumer/runtime.py:186
+self._consumer.subscribe([topic])
+```
+
+**This call performs no network I/O and returns in microseconds.** It records the
+subscription and signals `rdk:main`. That is all.
+
+Everything real happens afterwards on C threads, while your loop is already spinning.
+The producer's startup is steps 1–2; the consumer adds four more:
+
+| # | Request | Who answers | Purpose |
+|---|---|---|---|
+| 1 | ApiVersions | bootstrap broker | negotiate protocol versions |
+| 2 | Metadata | bootstrap broker | brokers, topics, partitions, leaders — then **cached** |
+| 3 | **FindCoordinator** | bootstrap broker | which broker owns this `group.id` |
+| 4 | **JoinGroup** | coordinator | get a `member.id` + generation; one member is elected leader |
+| 5 | **SyncGroup** | coordinator | the elected *client* computes the assignment and uploads it |
+| 6 | **OffsetFetch** | coordinator | where did this group leave off? |
+| 7 | Fetch | **partition leaders** | the actual records, long-polled continuously |
+
+Steps 3–6 are consumer-only. Three details worth keeping:
+
+**The coordinator is chosen by hashing the group id.** Kafka computes
+`murmur2(group.id) % 50` to pick a partition of the internal `__consumer_offsets` topic;
+that partition's leader is the group's coordinator, and it stores both membership and
+committed offsets. Because each service has its own `group.id`, each gets independent
+state — which is what makes **D7**'s fan-out work and why stopping one service cannot
+affect the others.
+
+**The broker does not compute the assignment — a client does.** In step 4 the
+coordinator elects one member as leader; in step 5 that member runs the assignor and
+uploads the result for everyone. With one consumer per group and three partitions, that
+member is assigned all three.
+
+**`auto.offset.reset` only applies at step 6, and only once.** If OffsetFetch returns
+`-1` (no committed offset for this group), the client sends a `ListOffsets` request and
+starts at `earliest`. Once anything has been committed, the setting is never consulted
+again — which is why changing `CONSUMER_GROUP_ID` to an unused value replays the topic
+from the beginning (**D12**).
+
+```python
+# src/order_service/consumer/runtime.py:156-168
+self._consumer = Consumer(
+    {
+        "bootstrap.servers": settings.kafka_bootstrap_servers,
+        "group.id": self._group_id,          # → steps 3-6 exist at all (D7)
+        "enable.auto.commit": False,         # → §13 (D10)
+        "auto.offset.reset": "earliest",     # → consulted only at step 6
+        "client.id": f"order-service-{spec.name}",
+    }
+)
+```
+
+Like the producer, none of this blocks or raises. Start with the broker down and both
+`Consumer(...)` and `subscribe(...)` still succeed — you find out from `poll()`.
+
+---
+
+## 11. The fetch queue — §6 in reverse
+
+The producer's `produce()` appends to a C-side queue that broker threads drain
+*outward*. The consumer is the mirror: broker threads fill a C-side queue *inward*, and
+`poll()` drains it.
+
+```
+PRODUCER                              CONSUMER
+your thread                           C broker thread
+    │ produce()                           │ Fetch response arrives
+    ▼                                     ▼
+┌─────────────┐                     ┌─────────────┐
+│ send queue  │  ← C memory →       │ fetch queue │
+└─────────────┘                     └─────────────┘
+    │ C broker thread                     │ poll()
+    ▼ batches & sends                     ▼ your Python thread
+  broker                                your handler
+```
+
+The broker threads keep Fetch requests permanently in flight; they do not wait for you.
+Each response is decompressed and split into a **per-partition queue**, and those are
+forwarded into one queue that `poll()` reads. With three partitions you have three fetch
+queues feeding one loop, which is exactly why every log line carries `partition=`:
+
+```python
+# src/order_service/consumer/runtime.py:247-256
+logger.info(
+    "[%s] partition=%d offset=%d key=%s order_id=%s seq=%d type=%s", ...
+)
+```
+
+Ordering is guaranteed **within** a partition, never across them.
+
+Prefetching is aggressive: by the time your loop asks for message #1, thousands may
+already be in memory. The knobs mirror each other exactly:
+
+| | producer | consumer |
+|---|---|---|
+| queue depth | `queue.buffering.max.messages` (100 000) | `queued.min.messages` (100 000) |
+| queue bytes | `queue.buffering.max.kbytes` (~1 GB) | `queued.max.messages.kbytes` (64 MB) |
+| batch timing | `linger.ms` (5 ms) | `fetch.wait.max.ms` (500 ms) |
+| batch trigger | `batch.num.messages` (10 000) | `fetch.min.bytes` (1) |
+| per-request cap | `message.max.bytes` (1 MB) | `max.partition.fetch.bytes` (1 MB) |
+
+**The one real asymmetry is what "full" means.**
+
+Producer-full pushes back *into your code* — the `BufferError` of §6(a), which becomes a
+`502`. Consumer-full pushes back *out to the broker*: librdkafka simply stops issuing
+Fetch requests for that partition until you drain some. No exception, nothing to handle,
+which is why the consume loop has no equivalent branch. A slow consumer is not an error;
+it is a consumer that fetches less often.
+
+---
+
+## 12. What `poll(1.0)` actually does
+
+Given §11, `poll()` is much less than it looks:
+
+> **Pop one item off the local C queue, waiting up to 1.0 s for one to appear — and
+> serve any pending callbacks.**
+
+It does **not** send a Fetch. It does **not** send a heartbeat. `rdk:main` and the broker
+threads already did both. `poll()` is the handoff point between C threads and Python.
+
+| | thread | does |
+|---|---|---|
+| `rdk:main` | background, C | metadata refresh, group state machine, heartbeats, timers |
+| `rdk:broker-N` | background, C | socket I/O — Fetch requests, responses, filling the queue |
+| **`poll()`** | **your Python thread** | dequeues one message; runs callbacks |
+
+Two consequences carried straight over from §2 and §6(b):
+
+**It releases the GIL.** The binding wraps the call in `Py_BEGIN_ALLOW_THREADS`, so that
+one-second wait costs no Python execution time — the same property that makes the
+producer's poll thread nearly free.
+
+**Callbacks run on your thread, inside `poll()`.** A `rebalance_cb` or `on_commit` is
+queued by the C threads and invoked only when you poll — identical to `on_delivery` in
+§6(b). librdkafka never calls into Python from its own threads.
+
+Three return shapes, and the loop handles each:
+
+| return | meaning | line |
+|---|---|---|
+| `None` | queue empty for 1.0 s — **not** "topic is empty" | 200 |
+| `Message` with `.error()` | a signal, not data | 202 |
+| `Message` with data | the real thing | 205 |
+
+The `1.0` is also the shutdown granularity. `main()` traps signals and only flips a
+boolean:
+
+```python
+# src/order_service/consumer/main.py:65-70
+def shutdown(signum: int, _frame: FrameType | None) -> None:
+    logger.info("[%s] signal %d received, shutting down", spec.name, signum)
+    consumer.stop()          # sets self._running = False, nothing more
+
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
+```
+
+A signal handler interrupts the main thread at an arbitrary bytecode boundary, so doing
+real work there — closing a socket, committing an offset — risks doing it mid-message.
+Setting a flag is safe; the loop notices within one second and unwinds normally.
+
+**The heartbeat nuance.** In the *Java* client heartbeats piggyback on `poll()`, so a
+slow handler gets you evicted. In librdkafka, `rdk:main` heartbeats on its own timer
+regardless. Instead the client enforces **`max.poll.interval.ms`** (default 5 min): if
+your application has not polled within that window, librdkafka leaves the group itself
+and surfaces `_MAX_POLL_EXCEEDED`. Academic while handlers only log — but a handler that
+made a real network call would meet it.
+
+---
+
+## 13. `commit()` is the consumer's delivery report
+
+This is the symmetry that makes both halves one story.
+
+```python
+# src/order_service/consumer/runtime.py:276
+self._consumer.commit(message=message, asynchronous=False)
+```
+
+An `OffsetCommit` to the **coordinator** (not the partition leader), appending a record
+to `__consumer_offsets`. `asynchronous=False` blocks until the broker acknowledges — the
+mirror of the producer's blocking `done.wait()`. Kafka stores "where to resume", i.e.
+`offset + 1`; passing `message=` lets the client do that arithmetic.
+
+**The placement is the decision (D10).** It is the last statement of `_handle_message`,
+after the handler has run:
+
+| | crash before commit | crash after commit |
+|---|---|---|
+| handler ran | redelivered → **handled twice** | fine |
+| handler did not run | redelivered → handled once ✓ | would be **lost** |
+
+Committing last makes the failure mode duplicates, never loss — **at-least-once**.
+Committing first would give at-most-once. This is also why `enable.auto.commit=False`
+matters: the auto-committer fires on a 5-second timer and would happily commit offsets
+for messages still sitting in the fetch queue, unhandled.
+
+Which yields the rule that ties §11 and §13 together:
+
+> **The queue is never the record. The log on disk is.**
+
+Suppose 5 000 messages are buffered, you have handled 12, and the process is `SIGKILL`ed.
+The other 4 988 vanish from memory — but they were never committed, so the next start
+refetches them. Nothing is lost. The same applies during a rebalance, which purges the
+queue for revoked partitions.
+
+One cost worth naming: a synchronous commit per message is one network round-trip per
+event, and that is this loop's throughput ceiling — the exact counterpart of the
+producer's per-event `done.wait()` in §7. Fine when you are reading log lines; a
+production consumer would commit every N messages and accept a wider redelivery window.
+
+The two error paths bracket this nicely. A message that will not decode is logged and
+**committed anyway**:
+
+```python
+# src/order_service/consumer/runtime.py:234-244
+except (ValueError, UnicodeDecodeError) as exc:
+    logger.error("[%s] undecodable message at %s[%d]@%d: %s", ...)
+    self._consumer.commit(message=message, asynchronous=False)
+    return
+```
+
+Not committing would re-read the same poison pill forever, blocking every good message
+behind it on that partition. And a *detected violation* does not stop anything either —
+`apply_event` records it and the fold advances regardless (**D9**), so one bad event
+produces one warning rather than an unending cascade.
+
+---
+
+## 14. Why `close()` is not optional
+
+§7 walked a deadlock; this is its counterpart, and it is a *distributed* failure rather
+than a local one.
+
+```python
+# src/order_service/consumer/runtime.py:206-209
+finally:
+    self._consumer.close()
+    logger.info("[%s] consumer closed", self._spec.name)
+```
+
+`close()` commits pending offsets, sends **LeaveGroup**, and tears down the threads. In a
+`finally`, so it runs on clean exit and on a fatal exception alike.
+
+Skip it — `SIGKILL`, or a container that never handled `SIGTERM` — and:
+
+1. The process dies without leaving the group.
+2. The coordinator still believes the member is alive.
+3. It waits out `session.timeout.ms` (45 s by default) before declaring it dead.
+4. Only then does it rebalance. **Nobody consumes those partitions for that whole
+   window.**
+
+That is the entire reason `main.py` traps `SIGTERM` and not just `SIGINT`: `SIGINT` is
+Ctrl-C from `docker compose up`, but `SIGTERM` is what `docker compose down` sends. Miss
+it and Docker `SIGKILL`s after ten seconds — no commit, no LeaveGroup, a stalled group.
+
+The exit codes are deliberate too:
+
+```python
+# src/order_service/consumer/main.py:59-61, 74-76
+except KeyError as exc:
+    logger.error("%s", exc)
+    sys.exit(2)              # bad SERVICE_NAME — restarting will not help
+...
+except KafkaException as exc:
+    logger.error("[%s] fatal kafka error: %s", spec.name, exc)
+    sys.exit(1)              # broker fault — restarting might
+```
+
+Fail fast on configuration, fail safe on data: a bad `SERVICE_NAME` exits immediately,
+while a bad *message* is logged, committed, and skipped. Opposite policies, on purpose —
+config errors never fix themselves, and one malformed record should not take down a
+service.
+
+---
+
+> **BOTH HALVES**
+
+## 15. Picking the right tool
 
 | Situation | Use | Why |
 |---|---|---|
@@ -293,31 +657,52 @@ that is the right trade when a human is holding the other end.
 | Many concurrent network waits | event loop | one thread, thousands of pending awaits |
 | C library with its own threads | let it run, service its callbacks | it does not need yours |
 | Blocking call inside `async def` | `asyncio.to_thread` — or just use `def` | never block the loop |
+| A process that is *called* | web framework | it needs a socket, routes, status codes |
+| A process that *calls* | a bare loop | the broker already provides the plumbing |
 
 ---
 
-## 9. Recap
+## 16. Recap
 
 | Term | One line | Where in this repo |
 |---|---|---|
 | Main thread | The thread the interpreter starts in; runs the event loop under uvicorn | [app.py](../src/order_service/producer/app.py) |
-| OS thread | Real kernel thread; `threading.Thread` creates one | [kafka_producer.py:81](../src/order_service/producer/kafka_producer.py#L81) |
+| OS thread | Real kernel thread; `threading.Thread` creates one | [kafka_producer.py:62](../src/order_service/producer/kafka_producer.py#L62) |
 | GIL | One Python bytecode at a time; released during I/O and in C code | why the poll thread is nearly free |
-| Process | Separate memory and GIL; nothing shared | [`_orders`](../src/order_service/producer/orders.py#L154) resets per process (D5) |
+| Process | Separate memory and GIL; nothing shared | [`_orders`](../src/order_service/producer/orders.py#L111) resets per process (D5) |
 | Thread pool | Fixed reusable threads on a work queue; caps concurrency | anyio, behind every `def` route |
 | Event loop | One thread, one task at a time, switches at `await` | uvicorn |
-| `def` route | Runs in the threadpool — may block | [routes.py:257](../src/order_service/producer/routes.py#L257) (D6) |
+| `def` route | Runs in the threadpool — may block | [routes.py:204](../src/order_service/producer/routes.py#L204) (D6) |
 | `async def` route | Runs on the loop — must never block | not used for publishing here |
-| librdkafka queue | C-side buffer `produce()` appends to and returns | [`_produce`](../src/order_service/producer/kafka_producer.py#L197) |
-| `poll()` | Serves queued callbacks into Python | [`_poll_loop`](../src/order_service/producer/kafka_producer.py#L123) (D6) |
-| `flush()` | Blocks until the queue drains; call before exit | [`stop`](../src/order_service/producer/kafka_producer.py#L87) (D6) |
+| librdkafka send queue | C-side buffer `produce()` appends to and returns | [`_produce`](../src/order_service/producer/kafka_producer.py#L167) |
+| `Producer.poll()` | Serves queued callbacks into Python | [`_poll_loop`](../src/order_service/producer/kafka_producer.py#L100) (D6) |
+| `flush()` | Blocks until the send queue drains; call before exit | [`stop`](../src/order_service/producer/kafka_producer.py#L68) (D6) |
+| `rdk:main` | C thread: metadata, group state machine, heartbeats | never visible from Python |
+| `rdk:broker-N` | C thread per connection: the actual socket I/O | one per broker |
+| Consumer group | `group.id`; owns an offset per partition, so groups are independent | [`group_id_for`](../src/order_service/config.py#L31) (D7) |
+| Coordinator | The broker that owns a group's membership and offsets | picked by hashing `group.id` |
+| Rebalance | Members join/leave → partitions reassigned by an elected client | `JoinGroup` + `SyncGroup` |
+| librdkafka fetch queue | C-side buffer the broker threads fill and `poll()` drains | §11 |
+| `Consumer.poll()` | Dequeues one message; runs callbacks; releases the GIL | [`run`](../src/order_service/consumer/runtime.py#L179) |
+| `commit()` | Makes consumption durable — the consumer's delivery report | [`_handle_message`](../src/order_service/consumer/runtime.py#L276) (D10) |
+| `close()` | Commits, sends LeaveGroup, stops the threads; call before exit | [`run`](../src/order_service/consumer/runtime.py#L206) |
 
-**The one sentence to keep:** `produce()` hands a message to a C-side queue drained by
-threads you do not control, and its result only reaches your Python code while somebody
-calls `poll()` — so the poll thread, not the broker, is what makes a blocking publish
-return.
+**The producer sentence to keep:** `produce()` hands a message to a C-side queue drained
+by threads you do not control, and its result only reaches your Python code while
+somebody calls `poll()` — so the poll thread, not the broker, is what makes a blocking
+publish return.
+
+**The consumer sentence to keep:** the C threads run Kafka whether you poll or not —
+connecting, heartbeating, fetching, rebalancing — so `poll()` is just your Python thread
+walking over to ask "anything for me?", and `commit()`, not `poll()`, is what makes
+having read it mean something.
+
+**And the pair:** `produce()` and `poll()` are both *buffer* operations; the delivery
+report and the offset commit are the *acknowledgements*. Confuse the two on either side
+and you get a silent data-loss bug that only shows up under failure.
 
 ---
 
 Related: [specs/001-prepaid-order-service/design.md](../specs/001-prepaid-order-service/design.md)
-(D5, D6) · [DECISIONS.md](../DECISIONS.md) (X1)
+(D5, D6, D7, D8, D9, D10, D12) · [DECISIONS.md](../DECISIONS.md) (X1, X3) ·
+[order-flow.md](order-flow.md)
