@@ -4,6 +4,7 @@
 acknowledgement arrives later on a delivery callback, and callbacks only fire while
 somebody calls ``poll()``. Hence the background poll thread — without it a caller
 waiting on a delivery report would wait forever.
+
 """
 
 import logging
