@@ -73,16 +73,21 @@ quietly keeping it.
 ## Testing
 
 **This project has no test suite. Do not write tests, and do not add one.** No
-`tests/` directory, no pytest, no test tasks in `tasks.md`.
+`tests/` directory, no pytest.
 
-Correctness is established by the **verification experiments** in each feature's
-`tasks.md` — run against a real broker, observed, and their results recorded in the
-spec. That is the stronger evidence here: the questions this repo asks are about how
-Kafka actually behaves (does the key really pin the partition, does a stopped group
-really not block the others), and a mocked broker cannot answer any of them.
+**`tasks.md` contains implementation steps only.** No test tasks, and no
+verification-experiment tasks either. Every numbered task must be a change to code,
+config, or docs that a requirement asked for — nothing whose deliverable is "run it
+and observe".
 
-If a change needs checking, run the experiments. If it needs a *new* check, add a
-numbered experiment that cites a requirement — not a unit test.
+Verification is manual and mine. After a feature's tasks are done, I run it against
+the real broker myself and judge whether it behaves. Do not run experiments, invent
+experiment numbers, or record observed results in the spec unless I explicitly ask.
+If you think something needs checking, say so in your response — don't turn it into
+a task.
+
+Existing specs (`001`, `002`) carry experiment sections from the earlier convention.
+Leave them as historical record; don't extend them.
 
 ## Git
 
