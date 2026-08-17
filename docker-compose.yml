@@ -3,11 +3,24 @@
 # there is no stable name to `docker restart`, and every replica would share one
 # environment block — which makes a distinct group.instance.id per instance
 # impossible and defeats static membership outright.
-x-notification-consumer: &notification-consumer
+# Every service below builds the SAME image and pins the same tag. Without the shared
+# tag, compose derives an image name per service — and `docker compose build` skips
+# services behind a profile, so notification-consumer-2 and -3 silently keep running
+# whatever code they were last built with. That produced a false result once already:
+# two members of one group running different specs, with only a missing banner line to
+# show for it. One tag makes a stale member impossible, and makes the Dockerfile's
+# opening claim ("one image for the order service and all three consumers") true.
+x-consumer-image: &consumer-image
   build: .
+  image: kafka-playground:local
+
+x-notification-consumer: &notification-consumer
+  <<: *consumer-image
   command: python -m order_service.consumer.main
-  depends_on:
+  depends_on: &consumer-deps
     kafka:
+      condition: service_healthy
+    postgres:
       condition: service_healthy
 
 x-notification-env: &notification-env
@@ -25,6 +38,29 @@ x-notification-env: &notification-env
   CONSUMER_GROUP_PROTOCOL: ${CONSUMER_GROUP_PROTOCOL:-classic}
   CONSUMER_ASSIGNMENT_STRATEGY: ${CONSUMER_ASSIGNMENT_STRATEGY:-}
   CONSUMER_REMOTE_ASSIGNOR: ${CONSUMER_REMOTE_ASSIGNOR:-}
+
+# --- spec 003: the durable state store, written once for all five consumers ------
+# STATE_BACKEND defaults to `memory` in config.py so a bare `python -m
+# order_service.consumer.main` still reproduces 001's and 002's recorded results
+# (003 D8). Compose turns it on explicitly — the assembled system runs the durable path.
+#
+# The DSN is built here rather than passed as five discrete settings so psycopg's own
+# parser stays in charge and compose has one string to keep consistent. `${VAR:?...}`
+# rather than `${VAR:-default}`: a default password is still a hardcoded credential
+# (003 D13, R3.24). Copy .env.example to .env before the first `up`.
+#
+# From the host the same consumer uses @localhost:5432 instead of @postgres:5432 and
+# changes nothing else — the shape R1.44 established for the broker (R3.26).
+#
+# The two levers (STATE_WRITE_ORDER, STATE_CRASH_AFTER) are deliberately NOT here.
+# They are set per-experiment on ONE instance, the way 002 sets HANDLER_DELAY_SECONDS.
+x-state-db-env: &state-db-env
+  # Overridable so the whole group can be flipped back to 002's in-process state in one
+  # variable, which is what makes the before/after comparison a single change:
+  #   STATE_BACKEND=memory docker compose --profile scale-out up -d
+  # Same shape as CONSUMER_GROUP_PROTOCOL above, and for the same reason.
+  STATE_BACKEND: ${STATE_BACKEND:-postgres}
+  STATE_DB_DSN: postgresql://${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
 
 services:
   kafka:
@@ -71,6 +107,42 @@ services:
       retries: 10
       start_period: 20s
 
+  # --- spec 003: the durable consumer state store -------------------------
+  # Holds order_fold ONLY — the consumers' derived memory. The producer's
+  # OrderStore stays in memory by design (003 D12): it is source-of-truth
+  # state whose fix is a transactional outbox, not a table, and the topic is
+  # already the source of truth for everything stored here.
+  #
+  # 5432 is published to the host for the same reason 9092 is: an experiment
+  # can run in compose and be inspected with psql from outside it.
+  #
+  # NOTE: the initdb mount below runs ONLY when the volume is empty. After the
+  # first `up`, schema changes need scripts/apply_state_schema.sh (003 D11).
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    ports:
+      # Overridable because a developer machine very often already runs Postgres on
+      # 5432, and a port clash should be one .env line rather than a reason to stop
+      # publishing. The container side never moves, so STATE_DB_DSN is unaffected.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/state_schema.sql:/docker-entrypoint-initdb.d/state_schema.sql:ro
+    healthcheck:
+      # -U/-d matter: the default `pg_isready` probes the `postgres` database as
+      # the `postgres` role, which need not exist here, so it can report healthy
+      # while the database the consumers use is still starting.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -100,7 +172,7 @@ services:
   # to show that stopping one leaves them untouched.
 
   order-service:
-    build: .
+    <<: *consumer-image
     container_name: order-service
     command: python -m order_service.producer.app
     ports:
@@ -115,7 +187,7 @@ services:
         condition: service_healthy
 
   inventory-consumer:
-    build: .
+    <<: *consumer-image
     container_name: inventory-consumer
     command: python -m order_service.consumer.main
     environment:
@@ -123,9 +195,8 @@ services:
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
-    depends_on:
-      kafka:
-        condition: service_healthy
+      <<: *state-db-env
+    depends_on: *consumer-deps
 
   # --- spec 002: notification scales out ----------------------------------
   # Three instances, ONE group id. The three partitions divide between them, so
@@ -144,7 +215,7 @@ services:
     <<: *notification-consumer
     container_name: notification-consumer-1
     environment:
-      <<: *notification-env
+      <<: [*notification-env, *state-db-env]
       CONSUMER_INSTANCE_ID: notification-1
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
 
@@ -153,7 +224,7 @@ services:
     container_name: notification-consumer-2
     profiles: ["scale-out"]
     environment:
-      <<: *notification-env
+      <<: [*notification-env, *state-db-env]
       CONSUMER_INSTANCE_ID: notification-2
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
 
@@ -162,12 +233,12 @@ services:
     container_name: notification-consumer-3
     profiles: ["scale-out"]
     environment:
-      <<: *notification-env
+      <<: [*notification-env, *state-db-env]
       CONSUMER_INSTANCE_ID: notification-3
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
   analytics-consumer:
-    build: .
+    <<: *consumer-image
     container_name: analytics-consumer
     command: python -m order_service.consumer.main
     environment:
@@ -175,9 +246,9 @@ services:
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
-    depends_on:
-      kafka:
-        condition: service_healthy
+      <<: *state-db-env
+    depends_on: *consumer-deps
 
 volumes:
   kafka-data:
+  postgres-data:

@@ -86,10 +86,20 @@ The consume loop does not learn SQL. A new module `consumer/state.py` defines:
 ```python
 class StateStore(Protocol):
     def load(self, partition: int, order_id: str) -> OrderFold | None: ...
-    def save(self, partition: int, order_id: str, fold: OrderFold) -> SaveOutcome: ...
+    def save(self, partition: int, order_id: str,
+             fold: OrderFold, event_id: str) -> SaveOutcome: ...
     def forget(self, partitions: Iterable[int]) -> None: ...
+    def held(self) -> list[int]: ...
     def close(self) -> None: ...
 ```
+
+**Amended during implementation, twice.** `OrderFold` lives in `state.py`, not in
+`runtime.py` as first written: `PostgresStateStore` builds one from a database row, so it
+needs the class at runtime and the import can only point one way — `runtime` → `state`.
+And `save()` takes `event_id` alongside the fold, because the table records which event
+last advanced a row (001 D11) while `apply_event()` does not track it; passing it beside
+the fold is what keeps that function untouched, which R3.6 depends on. `held()` was added
+for the rebalance log line, which used to read `self._folds` directly.
 
 with `MemoryStateStore` (002's `dict[int, dict[str, OrderFold]]`, lifted out of
 `ServiceConsumer` unchanged) and `PostgresStateStore`. `ServiceConsumer._folds` and
@@ -172,18 +182,35 @@ token, so this feature adds no dedup table and no new identifier. The whole mech
 statement:
 
 ```sql
-INSERT INTO order_fold (group_id, order_id, last_sequence, state, last_event_id, handled_count)
-VALUES (%(group)s, %(order)s, %(seq)s, %(state)s, %(event_id)s, 1)
-ON CONFLICT (group_id, order_id) DO UPDATE SET
-    last_sequence = GREATEST(order_fold.last_sequence, EXCLUDED.last_sequence),
-    state         = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
-                         THEN EXCLUDED.state ELSE order_fold.state END,
-    last_event_id = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
-                         THEN EXCLUDED.last_event_id ELSE order_fold.last_event_id END,
-    handled_count = order_fold.handled_count + 1,
-    updated_at    = now()
-RETURNING last_sequence, handled_count;
+WITH previous AS (
+    SELECT last_sequence FROM order_fold
+     WHERE group_id = %(group_id)s AND order_id = %(order_id)s
+), upserted AS (
+    INSERT INTO order_fold (group_id, order_id, last_sequence, state, last_event_id, handled_count)
+    VALUES (%(group_id)s, %(order_id)s, %(sequence)s, %(state)s, %(event_id)s, 1)
+    ON CONFLICT (group_id, order_id) DO UPDATE SET
+        last_sequence = GREATEST(order_fold.last_sequence, EXCLUDED.last_sequence),
+        state         = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
+                             THEN EXCLUDED.state ELSE order_fold.state END,
+        last_event_id = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
+                             THEN EXCLUDED.last_event_id ELSE order_fold.last_event_id END,
+        handled_count = order_fold.handled_count + 1,
+        updated_at    = now()
+    RETURNING last_sequence, handled_count
+)
+SELECT upserted.last_sequence, upserted.handled_count,
+       COALESCE(previous.last_sequence, 0) AS previous_sequence
+  FROM upserted LEFT JOIN previous ON true;
 ```
+
+**The `previous` CTE was added during implementation**, and the first version was wrong
+without it. `applied` was derived as "the row now carries the sequence we sent" — which is
+also true of an *exact* redelivery, because `GREATEST(n, n)` is `n`. The one case the
+feature exists to detect was the one case it would have missed. Inside `DO UPDATE` the
+qualified name `order_fold.last_sequence` is the old value, but in `RETURNING` it is the
+new one, so the pre-write sequence is otherwise unreachable. Every CTE in one statement
+sees the same snapshot, so `previous` reads the row as it stood before the upsert — and it
+is **still one statement**, which is the part the paragraph below depends on.
 
 Two things happen in that one statement, and their asymmetry is the design:
 
@@ -297,6 +324,50 @@ reasoning as 002 D2's YAML anchor.
 does nothing at all, silently. `apply_state_schema.sh` is the answer, and the README section
 must say so, because "I changed the schema and nothing happened" is otherwise a half-hour.
 
+### D14 — A redelivery is not a violation — *R3.6, R3.14*
+
+**Added during implementation, from what T21 showed.** Durable memory introduces a false
+positive that neither 001 nor 002 could produce: a redelivered event has a sequence at or
+*behind* the stored one, so `apply_event()` reports both a `SEQUENCE_GAP`
+(`expected=2 observed=1`) and an `ILLEGAL_TRANSITION` (`ORDER_CREATED after CREATED`).
+
+Nothing was wrong with the data. We saw it twice, which is what at-least-once delivery is
+entitled to do. Reporting that under 001's `VIOLATION` marker would mean this feature
+removed one class of false positive and quietly introduced another — and R3.6 asks for
+*genuine* violations, which this is not.
+
+So the consume loop compares the incoming sequence against the stored fold **before**
+folding, and suppresses the diagnosis when the event has already been applied. The handler
+still runs and the delivery is still counted (R3.14); only the violation lines are
+withheld, replaced by `DUPLICATE_ABSORBED`.
+
+This costs nothing in detection power, which T26 checks in both directions: a forced
+illegal transition is still reported, and a consumer that *genuinely* lost an event still
+reports the gap when the next one arrives — while a consumer that did not lose it reports
+nothing about the same event.
+
+*Rejected:* leaving the violations in and explaining them in the documentation. It makes
+`grep VIOLATION` — which 001 R1.41 designed as the whole filtering story — useless on any
+consumer that has ever been redelivered anything.
+
+### D15 — One image tag for every service that builds from this repository
+
+**Added during implementation, after it produced a false result.** Each compose service
+carried a bare `build: .`, so compose derived an image name *per service* — and
+`docker compose build` skips services behind a profile. `notification-consumer-2` and `-3`
+therefore kept running spec 002's code while `-1` ran 003's, in the same consumer group,
+with nothing to show for it but a missing banner line. The first T19 run reported four
+sequence gaps that meant nothing.
+
+Every service now shares `image: kafka-playground:local` through one anchor, so a stale
+member is not expressible. This also makes the Dockerfile's opening claim — *"one image for
+the order service and all three consumers"* — true, which it had not been since 002 split
+notification into three services.
+
+It is recorded as a decision rather than a fix because the failure mode is invisible: two
+members of one group silently running different specifications is exactly the kind of thing
+that makes an experiment lie, in a repository whose entire output is observations.
+
 ### D12 — What the table deliberately does not contain
 
 | Not stored | Why |
@@ -325,8 +396,12 @@ A single DSN rather than five discrete settings keeps psycopg's own parser in ch
 compose one string to build instead of five to keep consistent.
 
 **Host and compose differ by that one string** (R3.26). The Postgres container publishes
-`5432` on the host exactly as the broker publishes `9092`, so a host-run consumer uses
-`@localhost:5432` and a compose-run consumer uses `@postgres:5432`, with nothing else changing
+`5432` on the host exactly as the broker publishes `9092` — through
+`${POSTGRES_HOST_PORT:-5432}`, because a developer machine very often already runs Postgres
+there and a port clash should cost one `.env` line rather than the ability to inspect the
+database from outside compose. The *container* side never moves, so `STATE_DB_DSN` is
+unaffected. A host-run consumer uses `@localhost:<host port>` and a compose-run consumer
+uses `@postgres:5432`, with nothing else changing
 — the same shape R1.44 and R2.35 established for `localhost:9092` versus `kafka:19092`. Both
 reach the same database, so an experiment can be started in compose and inspected with `psql`
 from the host.

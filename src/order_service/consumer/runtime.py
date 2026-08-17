@@ -7,13 +7,19 @@ from one image and one entry point (D8, R1.37).
 Each service is its own consumer group (D7). Kafka tracks an offset per group, so all
 three read every message and stopping one cannot affect the others.
 
-Offsets commit after the handler returns (R1.32), so delivery is at-least-once. The
-fold is in-memory and lost on restart, so a post-restart sequence-gap violation is
-indistinguishable from a real one (X3).
+Offsets commit after the handler returns (R1.32), so delivery is at-least-once. Where
+the fold *lives* is 003's subject: a :class:`~order_service.consumer.state.StateStore` is
+injected, so the same loop runs against 002's in-process dict or against Postgres, and
+the difference is one environment variable (003 D2, D8).
+
+With the durable store the two writes go to two systems — the fold to Postgres, the
+offset to Kafka — and nothing covers both. The order between them is deliberate and
+switchable (003 D4), and the window between them can be opened on purpose (003 D5).
 """
 
 import json
 import logging
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -27,7 +33,13 @@ from confluent_kafka import (
     TopicPartition,
 )
 
-from order_service.config import GroupProtocol, Settings
+from order_service.config import (
+    GroupProtocol,
+    Settings,
+    StateCrashPoint,
+    StateWriteOrder,
+)
+from order_service.consumer.state import OrderFold, StateStore, StateStoreUnavailable
 from order_service.events import (
     EXPECTED_NEXT_EVENT,
     RESULTING_STATE,
@@ -197,15 +209,6 @@ class Violation:
         )
 
 
-@dataclass(frozen=True)
-class OrderFold:
-    """What a service has accumulated about one order."""
-
-    order_id: str
-    last_sequence: int = 0
-    state: OrderState | None = None
-
-
 def apply_event(
     current: OrderFold | None, event: LifecycleEvent
 ) -> tuple[OrderFold, list[Violation]]:
@@ -263,8 +266,18 @@ def apply_event(
 class ServiceConsumer:
     """Runs one service against the lifecycle topic."""
 
-    def __init__(self, spec: ServiceSpec, settings: Settings) -> None:
+    def __init__(
+        self, spec: ServiceSpec, settings: Settings, store: StateStore
+    ) -> None:
         """Build a consumer for one service.
+
+        Args:
+            spec: The service to run.
+            settings: Resolved environment settings.
+            store: Where folded state lives (003 D2). Injected rather than constructed
+                here so ``main.py`` can fail on an unreachable database *before* this
+                consumer exists, and so the backend is one substitution rather than a
+                branch inside the loop.
 
         Raises:
             ConsumerConfigError: If the settings are incompatible with the selected
@@ -275,10 +288,7 @@ class ServiceConsumer:
         self._settings = settings
         self._group_id = settings.group_id_for(spec.name)
         self._instance = settings.instance_label
-        # Partition first, then order (D6). An instance holds state for exactly the
-        # partitions it owns, so a revocation is one `del` and the shape of the data
-        # structure says what co-partitioned state means.
-        self._folds: dict[int, dict[str, OrderFold]] = {}
+        self._store = store
         self._running = False
         self._consumer = Consumer(
             build_consumer_config(
@@ -340,6 +350,18 @@ class ServiceConsumer:
             self._settings.consumer_instance_id_static or "<dynamic>",
             self._settings.consumer_max_poll_interval_ms or "<client default>",
         )
+        # R3.23 — which backend produced this run's observations. Without it, an
+        # experiment run on the wrong backend is indistinguishable from one run on the
+        # right one, and the default being `memory` would be a trap rather than a
+        # compatibility guarantee (003 D8).
+        logger.info(
+            "[%s/%s] state_backend=%s write_order=%s crash_after=%s",
+            self._spec.name,
+            self._instance,
+            self._settings.state_backend,
+            self._settings.state_write_order,
+            self._settings.state_crash_after,
+        )
 
         try:
             while self._running:
@@ -350,6 +372,21 @@ class ServiceConsumer:
                     self._handle_error(message)
                     continue
                 self._handle_message(message)
+        except StateStoreUnavailable as exc:
+            # R3.22 — the deliberate opposite of 002 D8, where a rejected commit is
+            # survived and consumption continues. A lost commit is a membership fact and
+            # the new owner redoes the work; a lost state store means R3.5 can no longer
+            # be honoured, and continuing would commit offsets for events whose state
+            # was never written — silently and permanently, which is exactly the failure
+            # R3.18 exists to warn about, arriving by accident.
+            logger.error(
+                "[%s/%s] STATE_STORE_UNAVAILABLE backend=%s reason=%s",
+                self._spec.name,
+                self._instance,
+                self._settings.state_backend,
+                exc,
+            )
+            raise
         finally:
             self._consumer.close()
             logger.info("[%s] consumer closed", self._spec.name)
@@ -365,19 +402,23 @@ class ServiceConsumer:
         self._log_membership("ASSIGNED", partitions)
 
     def _on_revoke(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
-        """Log partitions given up and discard exactly their folds (R2.14)."""
+        """Log partitions given up and release exactly their state (R2.14, R3.9)."""
         self._log_membership("REVOKED", partitions)
-        self._drop_folds(partitions)
+        self._forget(partitions)
 
     def _on_lost(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
-        """Log partitions lost to an eviction and discard exactly their folds.
+        """Log partitions lost to an eviction and release exactly their state.
 
         Separate from ``_on_revoke`` because these partitions may already belong to
         another member, so committing against them fails — which is what makes the
         eviction experiment readable.
+
+        This is also where 003's sequence guard earns its keep: an evicted member can
+        finish a handler and write *after* its replacement has moved the order on. That
+        write loses to the guard rather than corrupting the new owner's state (003 D3).
         """
         self._log_membership("LOST", partitions)
-        self._drop_folds(partitions)
+        self._forget(partitions)
 
     def _log_membership(self, event: str, partitions: list[TopicPartition]) -> None:
         """Log one membership change with a stable marker (R2.9, R2.10)."""
@@ -388,19 +429,23 @@ class ServiceConsumer:
             self._instance,
             event,
             changed or "[]",
-            sorted(self._folds) or "[]",
+            self._store.held() or "[]",
         )
 
-    def _drop_folds(self, partitions: list[TopicPartition]) -> None:
-        """Forget the folded state for exactly these partitions (R2.14, D6).
+    def _forget(self, partitions: list[TopicPartition]) -> None:
+        """Release this member's in-process state for exactly these partitions.
 
-        The partitions this member keeps retain theirs. Whoever receives these next
-        starts with no memory of the orders on them, which is what produces R2.15's
-        sequence-gap violations — the same amnesia 001 saw on restart, now caused by
-        routine scaling. Not to be "fixed" here (D7).
+        **What this means now depends on the backend, and that is the whole feature.**
+
+        On the memory backend it is 002 unchanged: the folds are gone, so whoever
+        receives these partitions next starts with no memory of their orders and reports
+        R2.15's sequence-gap violations.
+
+        On the durable backend the same call drops a *cache* and issues no ``DELETE``
+        (R3.9). The record survives because the record was never in the process, so the
+        member that inherits the partition reads it and reports nothing (R3.8).
         """
-        for partition in {tp.partition for tp in partitions}:
-            self._folds.pop(partition, None)
+        self._store.forget(tp.partition for tp in partitions)
 
     def _handle_error(self, message: Message) -> None:
         """Log a broker-reported error on a polled message.
@@ -455,12 +500,23 @@ class ServiceConsumer:
             event.event_type,
         )
 
-        # D6 — the fold lives under the partition it arrived on, so it goes away with
-        # that partition and no other.
-        by_order = self._folds.setdefault(partition, {})
-        updated, violations = apply_event(by_order.get(event.order_id), event)
-        by_order[event.order_id] = updated
-        for violation in violations:
+        # 003 — the fold is read from the store rather than from a dict on self. On the
+        # durable backend a miss reads through to Postgres, so a partition this member
+        # has never held still arrives with its history (R3.4, R3.8).
+        current = self._store.load(partition, event.order_id)
+
+        # D14 — a redelivery is not a violation. Durable memory makes an event we have
+        # already folded look like an *out of order* one: its sequence is behind the
+        # stored one, so apply_event() reports a gap and an illegal transition. Nothing
+        # was wrong with the data — we simply saw it twice, which at-least-once delivery
+        # is entitled to do. Reporting it under 001's VIOLATION marker would mean this
+        # feature removed one class of false positive and introduced another.
+        # The handler still runs and the delivery is still counted; only the *diagnosis*
+        # is suppressed (R3.6, R3.14).
+        redelivered = current is not None and event.sequence <= current.last_sequence
+
+        updated, violations = apply_event(current, event)
+        for violation in [] if redelivered else violations:
             # R1.41 — WARNING and a stable marker, so `grep VIOLATION` is the whole
             # filtering story.
             logger.warning(
@@ -476,14 +532,100 @@ class ServiceConsumer:
         if handler is not None:
             handler(event)
 
-        # R2.23 — the eviction lever (D9). Placed after the handler and before the
+        # R2.23 — the eviction lever (002 D9). Placed after the handler and before the
         # commit on purpose: a member that sleeps past `max.poll.interval.ms` is thrown
         # out of the group here, so the commit below is the one that fails.
         if self._settings.handler_delay_seconds > 0:
             time.sleep(self._settings.handler_delay_seconds)
 
-        # R1.32 — only now, after the handler has run.
+        self._persist_and_commit(message, event, updated, partition)
+
+    def _persist_and_commit(
+        self,
+        message: Message,
+        event: LifecycleEvent,
+        fold: OrderFold,
+        partition: int,
+    ) -> None:
+        """Write the fold and commit the offset, in the configured order (003 D4).
+
+        Two writes, two systems, and no operation covering both. Which one goes first
+        decides *how* that gap fails:
+
+        ==================  ==========================================================
+        ``state_first``     crash in the gap → the event is redelivered, the fold write
+        (default)           is absorbed by the sequence guard, the handler runs twice
+        ``offset_first``    crash in the gap → the event is never redelivered and the
+                            fold is **permanently** missing it, silently
+        ==================  ==========================================================
+
+        The default is not a preference (R3.5). The lever exists so the other outcome
+        can be watched rather than asserted (R3.16, R3.18).
+
+        Raises:
+            StateStoreUnavailable: If the state store fails. Deliberately not caught
+                here — see :meth:`run` (R3.22).
+        """
+        if self._settings.state_write_order is StateWriteOrder.OFFSET_FIRST:
+            self._commit(message)
+            self._crash_if_configured(StateCrashPoint.OFFSET_COMMIT, event)
+            self._save_fold(event, fold, partition)
+            return
+
+        self._save_fold(event, fold, partition)
+        self._crash_if_configured(StateCrashPoint.STATE_WRITE, event)
+        # R1.32 — only now, after the handler has run and the state is durable.
         self._commit(message)
+
+    def _save_fold(
+        self, event: LifecycleEvent, fold: OrderFold, partition: int
+    ) -> None:
+        """Persist one fold and report a redelivery the guard absorbed (R3.14, D7).
+
+        Raises:
+            StateStoreUnavailable: If the write fails.
+        """
+        outcome = self._store.save(partition, event.order_id, fold, event.event_id)
+        if outcome.applied:
+            return
+        # The fold did not move, but the handler above already ran — the duplicate side
+        # effect was produced, not hidden. That is the half of the problem durable state
+        # does not fix, and `handled` is the number 008 exists to drive to zero.
+        logger.warning(
+            "[%s/%s] DUPLICATE_ABSORBED order_id=%s seq=%d stored_seq=%d handled=%d",
+            self._spec.name,
+            self._instance,
+            event.order_id,
+            event.sequence,
+            fold.last_sequence,
+            outcome.handled_count,
+        )
+
+    def _crash_if_configured(
+        self, point: StateCrashPoint, event: LifecycleEvent
+    ) -> None:
+        """Kill the process here if this is the configured crash point (003 D5).
+
+        **``os._exit`` and not ``sys.exit``.** Anything that unwinds the stack runs
+        :meth:`run`'s ``finally``, which closes the consumer — a *graceful* departure
+        from the group. That is a shutdown, not a crash, and it would produce a politer
+        rebalance than the failure being simulated. ``os._exit`` skips ``finally``,
+        ``atexit``, and buffer flushing, which is what a ``SIGKILL`` actually does.
+        """
+        if self._settings.state_crash_after is not point:
+            return
+        logger.critical(
+            "[%s/%s] CRASH_LEVER point=%s order_id=%s seq=%d — exiting hard",
+            self._spec.name,
+            self._instance,
+            point,
+            event.order_id,
+            event.sequence,
+        )
+        # Flush by hand: os._exit does not, and the line above is the evidence.
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        os._exit(1)
 
     def _commit(self, message: Message) -> None:
         """Commit one offset, surviving the loss of the partition it belongs to.

@@ -15,12 +15,18 @@ from types import FrameType
 
 from confluent_kafka import KafkaException
 
-from order_service.config import get_settings
+from order_service.config import Settings, StateBackend, get_settings
 from order_service.consumer import analytics, inventory, notification
 from order_service.consumer.runtime import (
     ConsumerConfigError,
     ServiceConsumer,
     ServiceSpec,
+)
+from order_service.consumer.state import (
+    MemoryStateStore,
+    PostgresStateStore,
+    StateStore,
+    StateStoreUnavailable,
 )
 
 logging.basicConfig(
@@ -55,6 +61,31 @@ def build_spec(service_name: str) -> ServiceSpec:
     return factory()
 
 
+def build_store(settings: Settings, group_id: str) -> StateStore:
+    """Build the state store this process will fold into (003 D8).
+
+    Args:
+        settings: Resolved environment settings.
+        group_id: The consumer group whose memory this store holds — part of the durable
+            primary key, so the three services stay independent (R3.2).
+
+    Returns:
+        The store selected by ``STATE_BACKEND``.
+
+    Raises:
+        StateStoreUnavailable: If the durable backend is selected and the database
+            cannot be reached, or ``STATE_DB_DSN`` is unset.
+    """
+    if settings.state_backend is StateBackend.MEMORY:
+        return MemoryStateStore()
+
+    if settings.state_db_dsn is None:
+        raise StateStoreUnavailable(
+            "STATE_BACKEND=postgres requires STATE_DB_DSN — see .env.example"
+        )
+    return PostgresStateStore(settings.state_db_dsn, group_id=group_id)
+
+
 def main() -> None:
     """Run the service named by ``SERVICE_NAME`` until interrupted."""
     settings = get_settings()
@@ -64,13 +95,23 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(2)
 
+    # R3.21 — before the Consumer exists, so a process that cannot honour R3.5 never
+    # joins the group. A member that joins and then dies has already cost a rebalance,
+    # and 002's whole point is that rebalances are not free.
+    try:
+        store = build_store(settings, group_id=settings.group_id_for(spec.name))
+    except StateStoreUnavailable as exc:
+        logger.error("[%s] %s", spec.name, exc)
+        sys.exit(2)
+
     # R2.21 — an incompatible protocol/setting pair is a configuration error, so it
     # exits like an unknown SERVICE_NAME does: immediately, without joining the group.
     # Restarting will not help either of them.
     try:
-        consumer = ServiceConsumer(spec, settings)
+        consumer = ServiceConsumer(spec, settings, store)
     except ConsumerConfigError as exc:
         logger.error("[%s] %s", spec.name, exc)
+        store.close()
         sys.exit(2)
 
     def shutdown(signum: int, _frame: FrameType | None) -> None:
@@ -85,6 +126,12 @@ def main() -> None:
     except KafkaException as exc:
         logger.error("[%s] fatal kafka error: %s", spec.name, exc)
         sys.exit(1)
+    except StateStoreUnavailable:
+        # Already logged with its marker in the consume loop (R3.22). Exiting non-zero
+        # rather than continuing is the point: see ServiceConsumer.run.
+        sys.exit(1)
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

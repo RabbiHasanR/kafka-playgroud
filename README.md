@@ -250,9 +250,9 @@ and put a genuinely out-of-order event on the log; all three services will repor
 |---|---|
 | Orders held in memory — a restart forgets them | accepted (a real service uses a database) |
 | No transactional outbox, so the record and the event cannot be atomic | out of scope; explained in the flow doc |
-| Consumer fold state lost on restart | 003 |
-| Duplicate processing after a crash (at-least-once) | 003, 008 |
-| No deduplication, though every event carries an `event_id` | 003, 008 |
+| Consumer fold state lost on restart | **closed by 003** |
+| Duplicate processing after a crash (at-least-once) | 008 — 003 absorbs it in the *state*, not in the side effect |
+| No deduplication, though every event carries an `event_id` | 008 — 003 gets idempotency from `sequence` instead |
 
 ---
 
@@ -307,3 +307,78 @@ Four things it demonstrates:
 | Rebalance duration and consumer lag are never measured | needs a load generator, excluded here |
 | Partition growth and key rehashing | a topic-level lesson, not a consumer-group one |
 | Single broker, RF 1 | 004 |
+
+---
+
+# Spec 003 — Durable Consumer State
+
+001 and 002 both ended with the same false alarm: a consumer that resumed at exactly the
+right offset and reported a `SEQUENCE_GAP` for events it had already seen. **Kafka
+remembers your position; nothing remembered your memory.** 003 moves the fold into
+Postgres, keyed by `(group_id, order_id)` — so it belongs to the *order*, not to whoever
+holds the partition — and the false alarm stops.
+
+Read [docs/durable-state.md](docs/durable-state.md) — it has the measured numbers.
+Full spec in [specs/003-durable-consumer-state/](specs/003-durable-consumer-state/requirements.md).
+
+```bash
+cp .env.example .env                      # POSTGRES_USER / PASSWORD / DB — no defaults given
+docker compose up -d --build              # postgres included; schema applied on first boot
+./scripts/create_topics.sh                # required after `down -v`
+docker compose --profile scale-out up -d  # three notification members
+
+# the memory itself
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT group_id, order_id, last_sequence, state, handled_count FROM order_fold LIMIT 10;"
+```
+
+The same rebalance that 002 recorded, now run twice one variable apart:
+
+```bash
+docker compose --profile scale-out up -d && ./scripts/place_orders.sh 9
+docker stop notification-consumer-2        # 0 of 3 orders report a gap
+
+STATE_BACKEND=memory docker compose --profile scale-out up -d
+docker stop notification-consumer-2        # 4 of 4 do — this is 002's result
+```
+
+`STATE_BACKEND` defaults to **`memory`**, so a consumer started with none of 003's settings
+still reproduces 001's and 002's recorded experiments. Compose turns it on. The startup
+banner names which backend is in force, so no run is ambiguous.
+
+## Levers
+
+| Variable | Default | What it is for |
+|---|---|---|
+| `STATE_BACKEND` | `memory` | `memory` \| `postgres` |
+| `STATE_DB_DSN` | unset | required when the backend is `postgres` |
+| `STATE_WRITE_ORDER` | `state_first` | `offset_first` loses data permanently, on purpose |
+| `STATE_CRASH_AFTER` | `none` | `state_write` \| `offset_commit` — opens the dual-write window |
+
+The offset commits to Kafka and the fold writes to Postgres, and **no operation covers
+both**. `STATE_CRASH_AFTER` makes that gap reachable: crash after the state write and the
+event is redelivered, absorbed by the sequence guard, and the handler runs twice —
+`handled_count` ends up above `last_sequence`, which is the residue 008 removes.
+
+```bash
+# rows that were handled more often than they have events
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT * FROM order_fold WHERE handled_count > last_sequence;"
+```
+
+## Schema
+
+One file, `scripts/state_schema.sql`, applied two ways: mounted into the container's
+`/docker-entrypoint-initdb.d/`, and by `./scripts/apply_state_schema.sh`. Both exist
+because **the mount runs only when the data volume is empty** — after the first `up`,
+editing the schema and running `up` again does nothing at all, silently.
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| Duplicate side effects after a crash between the two writes | 008 |
+| Offset and state cannot be written atomically | 008 |
+| Shared database, not state co-partitioned with the input | 007 |
+| Rebuild cost grows with history, not with key count | 007 |
+| The producer's own `OrderStore` is still in memory | transactional outbox; no spec claims it |

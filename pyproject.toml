@@ -13,6 +13,9 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    # spec 003 — the durable consumer state store. Only the consumer uses it; the
+    # producer's OrderStore stays in memory by design (003 D12).
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.setuptools.packages.find]
