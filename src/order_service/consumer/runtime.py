@@ -351,7 +351,6 @@ class ServiceConsumer:
                     continue
                 self._handle_message(message)
         finally:
-            # Leaves the group cleanly and flushes any pending commit.
             self._consumer.close()
             logger.info("[%s] consumer closed", self._spec.name)
 
