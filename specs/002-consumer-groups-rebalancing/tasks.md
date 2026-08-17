@@ -95,7 +95,7 @@ record what was seen in Results.
 - [ ] **T14** — **Fan-out survives scale-out.** Throughout T13, confirm inventory and
   analytics each still received every event, with lag returning to 0 — the 001 shape and
   the 002 shape running on one topic at once. — *R2.6*
-- [ ] **T15** — **The partition count is the ceiling.** Start a fourth notification
+- [x] **T15** — **The partition count is the ceiling.** Start a fourth notification
   instance and confirm `--members --verbose` shows it in the group holding zero partitions,
   consuming nothing, without error. — *R2.4*
 - [ ] **T16** — **Ordering survives scale-out.** With three members running, advance one
@@ -122,7 +122,7 @@ record what was seen in Results.
   instance only, and confirm that instance is removed from the group and its partitions
   reassigned **while its process is still running**, that its next commit fails with the
   distinct marker, and that it then rejoins rather than exiting. — *R2.25, R2.26, R2.27*
-- [ ] **T21** — **Static membership.** `docker restart notification-consumer-2` without a
+- [x] **T21** — **Static membership.** `docker restart notification-consumer-2` without a
   static identity and count the rebalances the other two members log; repeat with
   `STATIC_MEMBERSHIP` set and confirm the member returns to the same partitions with no
   redistribution. — *R2.29, R2.30*
@@ -146,22 +146,25 @@ record what was seen in Results.
 
 ## Results
 
-To be recorded after the experiments are run, in the same shape as
+Recorded in the same shape as
 [001's results table](../001-prepaid-order-service/tasks.md). Each row names what was
 actually observed — partition assignments, member ids, rebalance counts, and the markers
 that appeared — not what was expected.
+
+T15 and T21 were run on 2026-08-17 against a fresh broker volume, classic protocol with
+the default `range` assignor, three notification instances holding one partition each.
 
 | Task | Observed |
 |---|---|
 | T13 | — |
 | T14 | — |
-| T15 | — |
+| T15 | A 4th member joined the group and logged `REBALANCE ASSIGNED partitions=[] held=[]` — an empty assignment, no error. `--members --verbose` showed it with `#PARTITIONS 0` and `CURRENT-ASSIGNMENT -` while the other three held `order-lifecycle:0`, `:1`, `:2`. Nine orders placed afterwards were handled 1/1/7 across the three active members and **0** by the idle one. The uneven 1/1/7 split is the key hash, not the assignor: partitions are assigned evenly, keys are not distributed evenly across them |
 | T16 | — |
 | T17 | — |
 | T18 | — |
 | T19 | — |
 | T20 | — |
-| T21 | — |
+| T21 | Restarting `notification-consumer-2` three ways, counting `REBALANCE` lines logged by the **other two** members. **Dynamic + `docker restart`: 8** (4 each — `REVOKED` then `ASSIGNED`, twice: once when it left, once when it returned). **Static + `docker restart`: 2** (one `ASSIGNED` each, and **no `REVOKED` at all**, so `_drop_folds` never ran and both members kept their folds). **Static + `SIGKILL` then `start`: 0** — completely silent; the coordinator held partition 1 for the absent static member and handed it straight back |
 
 ## Notes
 
