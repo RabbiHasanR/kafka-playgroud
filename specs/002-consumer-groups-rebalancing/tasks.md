@@ -72,12 +72,12 @@ runtime before the config builder means writing the consume loop twice.
   `${STATIC_MEMBERSHIP:+notification-N}` so one variable toggles it for all three. Change
   no broker configuration and no inventory or analytics service.
   — *R2.1, R2.28, R2.36* — D2, D10
-- [ ] **T11** — Write `scripts/place_orders.sh`: place N orders against a running order
+- [x] **T11** — Write `scripts/place_orders.sh`: place N orders against a running order
   service, printing the `order_id`, partition, and offset of each, with an optional flag to
   advance every order it created through `PACKED → SHIPPED → DELIVERED`. Extract the two
   response fields with `sed` rather than depending on `jq`. It must carry no rate control,
   no concurrency, and no throughput reporting. — *R2.31, R2.32, R2.33* — D11
-- [ ] **T12** — Confirm the scaled-out group runs from the host against `localhost:9092`
+- [x] **T12** — Confirm the scaled-out group runs from the host against `localhost:9092`
   as well as inside the compose network against `kafka:19092`, changing only environment
   variables — three shells with three `CONSUMER_INSTANCE_ID` values and one shared
   `CONSUMER_GROUP_ID`. — *R2.35*
@@ -87,36 +87,36 @@ runtime before the config builder means writing the consume loop twice.
 Each is run and observed, not merely coded. Tick only after actually running it, and
 record what was seen in Results.
 
-- [ ] **T13** — **Scale-out divides.** Place 20 orders with one notification instance, then
+- [x] **T13** — **Scale-out divides.** Place 20 orders with one notification instance, then
   start `-2` and `-3` and place 20 more. Confirm the three members hold disjoint partition
   sets, that every event was handled by exactly one of them, and that
   `kafka-consumer-groups.sh --describe --group notification-service --members --verbose`
   reports the same split the logs do. — *R2.2, R2.3, R2.11, R2.12*
-- [ ] **T14** — **Fan-out survives scale-out.** Throughout T13, confirm inventory and
+- [x] **T14** — **Fan-out survives scale-out.** Throughout T13, confirm inventory and
   analytics each still received every event, with lag returning to 0 — the 001 shape and
   the 002 shape running on one topic at once. — *R2.6*
 - [x] **T15** — **The partition count is the ceiling.** Start a fourth notification
   instance and confirm `--members --verbose` shows it in the group holding zero partitions,
   consuming nothing, without error. — *R2.4*
-- [ ] **T16** — **Ordering survives scale-out.** With three members running, advance one
+- [x] **T16** — **Ordering survives scale-out.** With three members running, advance one
   order through all four events and confirm every one was handled by the same instance, in
   sequence order, because the key pinned it to one partition. — *R2.5*
-- [ ] **T17** — **A rebalance loses the fold.** Advance several orders part-way, kill one
+- [x] **T17** — **A rebalance loses the fold.** Advance several orders part-way, kill one
   instance, and confirm its partitions move to the survivors and that the receiving
   instance reports `SEQUENCE_GAP` for the in-flight orders on the partition it inherited —
   the same amnesia as 001's T35, now caused by routine scaling rather than a crash, while
   the offsets themselves resume correctly from the group's last commit.
   — *R2.13, R2.15, R2.16*
-- [ ] **T18** — **Eager versus cooperative.** Run the same join-and-leave under
+- [x] **T18** — **Eager versus cooperative.** Run the same join-and-leave under
   `CONSUMER_ASSIGNMENT_STRATEGY=range` and under `cooperative-sticky`, and compare how many
   partitions were revoked from members that did not need to give anything up.
   — *R2.19*
-- [ ] **T19** — **Classic versus KIP-848.** Run the same join-and-leave under
+- [x] **T19** — **Classic versus KIP-848.** Run the same join-and-leave under
   `CONSUMER_GROUP_PROTOCOL=consumer` with `CONSUMER_REMOTE_ASSIGNOR=uniform`, and compare
   the rebalance log shape against T18's. Confirm from the startup banner which protocol and
   assignor were in force, and confirm that a consumer started with no protocol setting still
   joins as `classic`. — *R2.17, R2.18, R2.20, R2.22*
-- [ ] **T20** — **Eviction of a live consumer.** Lower the poll interval (and, under
+- [x] **T20** — **Eviction of a live consumer.** Lower the poll interval (and, under
   `classic`, the session timeout with it — the client enforces
   `max.poll.interval.ms >= session.timeout.ms`), set `HANDLER_DELAY_SECONDS` past it on one
   instance only, and confirm that instance is removed from the group and its partitions
@@ -129,16 +129,16 @@ record what was seen in Results.
 
 ## Documentation
 
-- [ ] **T22** — Write `docs/consumer-groups.md`: scale-out against 001's fan-out, what
+- [x] **T22** — Write `docs/consumer-groups.md`: scale-out against 001's fan-out, what
   triggers a rebalance, how the two protocols differ in who computes the assignment, a
   runnable walkthrough of growing and shrinking the group, and a closing section naming
   which observed behaviours are accepted limitations and which spec closes each.
   — *R2.37, R2.39*
-- [ ] **T23** — Amend §10 of `docs/concurrency-and-confluent-kafka.md`. Its bolded claim
+- [x] **T23** — Amend §10 of `docs/concurrency-and-confluent-kafka.md`. Its bolded claim
   *"The broker does not compute the assignment — a client does"* is false under KIP-848,
   and its JoinGroup/SyncGroup table is classic-only. Scope both to the classic protocol and
   add the KIP-848 path beside them rather than deleting what is there. — *R2.38*
-- [ ] **T24** — Add a `README.md` section for this feature: how to run the scaled-out
+- [x] **T24** — Add a `README.md` section for this feature: how to run the scaled-out
   group, how to grow it with the `scale-out` profile, the environment surface, and a link
   to the new document. Update the two existing forward references to 002 — in `README.md`
   and in the `docker-compose.yml` header comment — to describe what was built.
@@ -151,19 +151,20 @@ Recorded in the same shape as
 actually observed — partition assignments, member ids, rebalance counts, and the markers
 that appeared — not what was expected.
 
-T15 and T21 were run on 2026-08-17 against a fresh broker volume, classic protocol with
+All experiments were run on 2026-08-17 against a fresh broker volume. Unless a row says
+otherwise the configuration was the classic protocol with
 the default `range` assignor, three notification instances holding one partition each.
 
 | Task | Observed |
 |---|---|
-| T13 | — |
-| T14 | — |
+| T13 | With one member it held `order-lifecycle:0,1,2`. After `-2` and `-3` joined, the three held `:0`, `:1`, `:2` disjointly and `--members --verbose` matched the logs exactly. 12 orders × 4 events placed afterwards: **12/12 handled by exactly one member** |
+| T14 | Throughout T13, inventory and analytics each received **12/12 orders complete with all 4 events**. The 001 fan-out shape and the 002 scale-out shape ran on one topic simultaneously, neither affecting the other |
 | T15 | A 4th member joined the group and logged `REBALANCE ASSIGNED partitions=[] held=[]` — an empty assignment, no error. `--members --verbose` showed it with `#PARTITIONS 0` and `CURRENT-ASSIGNMENT -` while the other three held `order-lifecycle:0`, `:1`, `:2`. Nine orders placed afterwards were handled 1/1/7 across the three active members and **0** by the idle one. The uneven 1/1/7 split is the key hash, not the assignor: partitions are assigned evenly, keys are not distributed evenly across them |
-| T16 | — |
-| T17 | — |
-| T18 | — |
-| T19 | — |
-| T20 | — |
+| T16 | Of the same 12 orders, **12/12 had all four events handled by one member in sequence `[1,2,3,4]`** — none split across members, none out of order. The key pinned each order to a partition and the partition to a member, so ordering and parallelism held at once |
+| T17 | Six orders advanced to `PACKED`, then `SIGKILL` on `notification-2` (owner of partition 1). Partition 1 moved to `notification-1` (`:0,1`). Advancing all six to `SHIPPED` produced `SEQUENCE_GAP expected=1 observed=3` **and** `ILLEGAL_TRANSITION … observed=SHIPPED after None` on **6 of 6** — including the orders on partitions 0 and 2, which never changed owner. Offsets resumed correctly throughout (p0@29/30, p1@39/40/41, p2@37): Kafka restored every position, nothing restored the fold |
+| T18 | The same scenario under `cooperative-sticky`, 9 orders, 3 per partition. Survivors logged **zero `REVOKED`** — `notification-3: ASSIGNED [] held=[2]`, `notification-1: ASSIGNED [0] held=[1]` — both keeping their folds. Result: **3/9 gapped**, exactly the 3 on partition 0, the only partition that changed owner; partitions 1 and 2 were **0/3**. Against T17's eager 6/6 where only 3 needed to fail, that is the whole argument for cooperative rebalancing. Also observed: a member joining with a different assignor than the group is rejected with `INCONSISTENT_GROUP_PROTOCOL` and retries until the group converges |
+| T19 | Switching an existing group from `classic` to `consumer` **in place failed**: `FATAL … ConsumerGroupHeartbeat fatal error: Broker: The group id does not exist`, and all three consumers exited 1. After `--delete --group notification-service`, the group re-formed cleanly under `protocol=consumer assignor=uniform` with `:0`, `:1`, `:2`. The rebalance was **incremental like cooperative, not eager**: `notification-1` logged `REVOKED partitions=[1, 2] held=[0, 1, 2]` then `ASSIGNED [] held=[0]` — it gave up only the two partitions that had to move and kept partition 0's fold |
+| T20 | `HANDLER_DELAY_SECONDS=12` against `max.poll.interval.ms=7000` (with `session.timeout.ms=6000`, required by the client's `max.poll >= session` rule). The member was removed **while its process was alive and healthy**: `COMMIT_REJECTED … UNKNOWN_MEMBER_ID`, then `_MAX_POLL_EXCEEDED "exceeded by 375ms"`, then `REBALANCE LOST partitions=[0, 1, 2] held=[2]`, then an immediate rejoin. It then **livelocked**: never committing, it was redelivered offset 0 every cycle and evicted again, indefinitely — at-least-once plus a slow handler makes zero progress and reprocesses forever |
 | T21 | Restarting `notification-consumer-2` three ways, counting `REBALANCE` lines logged by the **other two** members. **Dynamic + `docker restart`: 8** (4 each — `REVOKED` then `ASSIGNED`, twice: once when it left, once when it returned). **Static + `docker restart`: 2** (one `ASSIGNED` each, and **no `REVOKED` at all**, so `_drop_folds` never ran and both members kept their folds). **Static + `SIGKILL` then `start`: 0** — completely silent; the coordinator held partition 1 for the absent static member and handed it straight back |
 
 ## Notes

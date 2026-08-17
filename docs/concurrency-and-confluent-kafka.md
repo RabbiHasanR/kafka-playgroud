@@ -376,7 +376,11 @@ self._consumer.subscribe([topic])
 subscription and signals `rdk:main`. That is all.
 
 Everything real happens afterwards on C threads, while your loop is already spinning.
-The producer's startup is steps 1–2; the consumer adds four more:
+The producer's startup is steps 1–2; the consumer adds four more.
+
+**This table describes the `classic` group protocol**, which is the default and what
+spec 001 uses throughout. Kafka 4.0 added a second protocol that replaces steps 4–5
+entirely — see *"Two protocols"* below.
 
 | # | Request | Who answers | Purpose |
 |---|---|---|---|
@@ -397,10 +401,40 @@ committed offsets. Because each service has its own `group.id`, each gets indepe
 state — which is what makes **D7**'s fan-out work and why stopping one service cannot
 affect the others.
 
-**The broker does not compute the assignment — a client does.** In step 4 the
-coordinator elects one member as leader; in step 5 that member runs the assignor and
-uploads the result for everyone. With one consumer per group and three partitions, that
-member is assigned all three.
+**Under the classic protocol the broker does not compute the assignment — a client
+does.** In step 4 the coordinator elects one member as leader; in step 5 that member runs
+the assignor and uploads the result for everyone. With one consumer per group and three
+partitions, that member is assigned all three.
+
+### Two protocols, as of Kafka 4.0
+
+Spec 002 exercises both, selected by `CONSUMER_GROUP_PROTOCOL` (**X9**). The difference is
+exactly *who runs the assignor*, and it changes what a rebalance costs.
+
+| | `classic` (default) | `consumer` — KIP-848 |
+|---|---|---|
+| Who computes the assignment | an elected **client** | the **broker** |
+| Handshake | JoinGroup + SyncGroup (steps 4–5) | ConsumerGroupHeartbeat |
+| Assignor knob | `partition.assignment.strategy` | `group.remote.assignor` |
+| Session timeout | client-side `session.timeout.ms` | **broker-side** — sending it raises |
+| Revocation | eager by default; `cooperative-sticky` opts out | incremental by design |
+
+The classic protocol's default assignors (`range`, `roundrobin`) are **eager**: every
+member surrenders every partition before the new assignment is computed, even partitions
+that were never going to move. `cooperative-sticky` and KIP-848 revoke only what actually
+changes hands.
+
+Measured in 002: under `range`, killing one member cost **6 of 6** in-flight orders their
+folded state; under `cooperative-sticky` the same scenario cost **3 of 9** — exactly the
+orders on the one partition that changed owner.
+
+Two operational notes that are easy to meet the hard way: an existing group **cannot be
+switched between protocols in place** (every member gets `ConsumerGroupHeartbeat fatal
+error: Broker: The group id does not exist` and exits — delete the group first), and a
+member joining with a different assignor than the rest of the group is rejected with
+`INCONSISTENT_GROUP_PROTOCOL` until the group converges.
+
+Full detail and the runnable comparisons: [consumer-groups.md](consumer-groups.md).
 
 **`auto.offset.reset` only applies at step 6, and only once.** If OffsetFetch returns
 `-1` (no committed offset for this group), the client sends a `ListOffsets` request and
@@ -681,7 +715,8 @@ service.
 | `rdk:broker-N` | C thread per connection: the actual socket I/O | one per broker |
 | Consumer group | `group.id`; owns an offset per partition, so groups are independent | [`group_id_for`](../src/order_service/config.py#L31) (D7) |
 | Coordinator | The broker that owns a group's membership and offsets | picked by hashing `group.id` |
-| Rebalance | Members join/leave → partitions reassigned by an elected client | `JoinGroup` + `SyncGroup` |
+| Rebalance | Members join/leave → partitions reassigned, by an elected client under `classic` or by the broker under KIP-848 | `JoinGroup` + `SyncGroup`; §10 |
+| Eager vs cooperative | Whether a rebalance revokes everything or only what moves — and therefore how much folded state is lost | [consumer-groups.md](consumer-groups.md) |
 | librdkafka fetch queue | C-side buffer the broker threads fill and `poll()` drains | §11 |
 | `Consumer.poll()` | Dequeues one message; runs callbacks; releases the GIL | [`run`](../src/order_service/consumer/runtime.py#L179) |
 | `commit()` | Makes consumption durable — the consumer's delivery report | [`_handle_message`](../src/order_service/consumer/runtime.py#L276) (D10) |

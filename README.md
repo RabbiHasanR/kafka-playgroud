@@ -189,8 +189,9 @@ Three things it demonstrates:
   on one partition and stay ordered. Different orders have no ordering guarantee
   between them, and that is correct rather than a limitation.
 - **Fan-out by consumer group.** One topic, three group ids, three independent
-  offsets. Spec 002 does the opposite — extra consumers in *one* group, where the
-  messages divide instead of duplicating.
+  offsets. [Spec 002](#spec-002--consumer-groups-rebalancing-and-partition-assignment)
+  does the opposite — extra consumers in *one* group, where the messages divide instead
+  of duplicating.
 - **The synchronous/asynchronous boundary.** `POST /orders` blocks because the caller
   needs an `order_id` back. Everything downstream of the event does not, and happens
   off the log.
@@ -252,3 +253,57 @@ and put a genuinely out-of-order event on the log; all three services will repor
 | Consumer fold state lost on restart | 003 |
 | Duplicate processing after a crash (at-least-once) | 003, 008 |
 | No deduplication, though every event carries an `event_id` | 003, 008 |
+
+---
+
+# Spec 002 — Consumer Groups, Rebalancing, and Partition Assignment
+
+001 put three **group ids** on one topic and every service saw every message. 002 puts
+three **members in one group** and the messages divide. Both run at once, on the same
+topic: `notification` scales to three instances while `inventory` and `analytics` stay
+single-instance as the control.
+
+Read [docs/consumer-groups.md](docs/consumer-groups.md) — it has the measured numbers.
+Full spec in [specs/002-consumer-groups-rebalancing/](specs/002-consumer-groups-rebalancing/requirements.md).
+
+```bash
+docker compose up -d --build              # group starts with ONE notification member
+./scripts/create_topics.sh                # required after `down -v`
+docker compose --profile scale-out up -d  # grow it to three, while watching the logs
+./scripts/place_orders.sh 12 --advance    # 12 orders × 4 events, no curl by hand
+
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group notification-service --members --verbose
+```
+
+Tear down with `docker compose --profile scale-out down` — a plain `down` orphans
+`notification-consumer-2` and `-3`.
+
+Four things it demonstrates:
+
+- **Scale-out divides, fan-out duplicates.** 12 of 12 orders went to exactly one group
+  member each, while inventory and analytics each received all 12 complete.
+- **Ordering survives parallelism.** The key pins an order to a partition and the
+  partition to one member, so all four of an order's events are handled by one consumer
+  in sequence — 12 of 12, with three consumers running.
+- **A rebalance costs whatever it revokes.** Killing one member under the default `range`
+  assignor destroyed the folded state of **6 of 6** in-flight orders; under
+  `cooperative-sticky` the same scenario cost **3 of 9** — only the partition that moved.
+- **The offset is not the memory.** Kafka restored every position perfectly and restored
+  no derived state at all. That gap is what spec 003 exists to close.
+
+| Lever | What it causes |
+|---|---|
+| `CONSUMER_ASSIGNMENT_STRATEGY=cooperative-sticky` | revoke only what moves |
+| `CONSUMER_GROUP_PROTOCOL=consumer` | KIP-848 — the broker assigns, not a client |
+| `HANDLER_DELAY_SECONDS=12` + a low `CONSUMER_MAX_POLL_INTERVAL_MS` | a live, healthy consumer evicted from its group, then livelocked |
+| `STATIC_MEMBERSHIP=1` | a restart that costs **0** rebalances instead of 8 |
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| A moved partition loses its fold → false `SEQUENCE_GAP` | 003, fully by 007 |
+| Rebalance duration and consumer lag are never measured | needs a load generator, excluded here |
+| Partition growth and key rehashing | a topic-level lesson, not a consumer-group one |
+| Single broker, RF 1 | 004 |

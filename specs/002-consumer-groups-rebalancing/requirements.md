@@ -1,6 +1,6 @@
 # 002 — Consumer Groups, Rebalancing, and Partition Assignment
 
-**Status:** draft — awaiting approval
+**Status:** implemented
 **Depends on:** [001-prepaid-order-service](../001-prepaid-order-service/requirements.md)
 
 ## Overview

@@ -16,6 +16,15 @@ x-notification-env: &notification-env
   SERVICE_NAME: notification
   # One group id across all three — this is the whole feature.
   CONSUMER_GROUP_ID: notification-service
+  # Passed through from the host so one variable reconfigures the WHOLE group.
+  # An assignor only means anything if every member agrees on it, which is why
+  # these are here and not per-instance. Empty reads as unset (002 D10), so a
+  # plain `up` is classic + the client default assignor, exactly as 001 behaved.
+  #   CONSUMER_ASSIGNMENT_STRATEGY=cooperative-sticky docker compose ... up -d
+  #   CONSUMER_GROUP_PROTOCOL=consumer CONSUMER_REMOTE_ASSIGNOR=uniform docker compose ... up -d
+  CONSUMER_GROUP_PROTOCOL: ${CONSUMER_GROUP_PROTOCOL:-classic}
+  CONSUMER_ASSIGNMENT_STRATEGY: ${CONSUMER_ASSIGNMENT_STRATEGY:-}
+  CONSUMER_REMOTE_ASSIGNOR: ${CONSUMER_REMOTE_ASSIGNOR:-}
 
 services:
   kafka:
@@ -82,8 +91,9 @@ services:
   #
   # The three consumers subscribe to the SAME topic with THREE DIFFERENT group
   # ids — that is the fan-out: each one receives every event and keeps its own
-  # offset. Spec 002 does the opposite, adding a second consumer to one group
-  # so the messages divide instead.
+  # offset. Spec 002 does the opposite below: notification runs as THREE members
+  # of ONE group, so the same three partitions divide between them instead.
+  # Both shapes run at once, which is what makes them comparable.
   #
   # All three come up with a plain `docker compose up` — the fan-out is only
   # visible when every group is reading, and T34/T39 need the other two running
