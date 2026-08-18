@@ -84,9 +84,12 @@ The setting that closes this is `min.insync.replicas` on the topic: set it to 2 
 *refuses* the write with `NOT_ENOUGH_REPLICAS` rather than accepting it into a degraded ISR.
 Durability is a contract with two halves, and the producer only holds one of them.
 
-**It is deliberately not set here** (004 D8) — honouring a refusal means building the retry
-path that answers it, which is spec **005**'s subject. Exactly-once production, where
-`acks=all` stops being a choice, is **008**.
+**It was deliberately not set at 004** (D8) — honouring a refusal means building the retry path
+that answers it. **Spec 005 built that path and set it to 2.** `scripts/create_topics.sh` now
+passes it at creation and `ALTER`s it onto topics that already exist, so closing this gap cost
+no `docker compose down -v`. See [retries-and-dlq.md](retries-and-dlq.md) §6.
+
+Exactly-once production, where `acks=all` stops being a choice, is **008**.
 
 ---
 
@@ -193,7 +196,7 @@ Running cost: three JVMs instead of one.
 
 | Gap | Where it closes |
 |---|---|
-| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | **005**, with the retry path a refusal needs |
+| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | **closed by 005** — set to 2, with the producer retry path a refusal needs |
 | Unclean leader election, and losing committed data on purpose | not scheduled; needs the row above first |
 | What `acks` costs in latency, measured | needs a load generator, excluded from this ladder |
 | Replica placement, rack awareness, `kafka-reassign-partitions` | never claimed |

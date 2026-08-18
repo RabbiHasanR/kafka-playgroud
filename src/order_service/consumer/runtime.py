@@ -39,6 +39,9 @@ from order_service.config import (
     StateCrashPoint,
     StateWriteOrder,
 )
+from order_service.consumer import failures
+from order_service.consumer.dlq import FailurePublishFailed, FailureRouter, Origin
+from order_service.consumer.errors import NonRetryableError, classify
 from order_service.consumer.state import OrderFold, StateStore, StateStoreUnavailable
 from order_service.events import (
     EXPECTED_NEXT_EVENT,
@@ -51,7 +54,9 @@ from order_service.events import (
 
 logger = logging.getLogger(__name__)
 
-#: Raising is not part of the handler contract at this spec.
+#: A handler may raise (005 R5.4). Returning normally means it succeeded; raising sends
+#: the message down the failure path, where :func:`~order_service.consumer.errors.classify`
+#: decides whether it waits for another attempt or goes straight to the dead-letter topic.
 Handler = Callable[[LifecycleEvent], None]
 
 #: What each protocol uses when its setting is left unset; shown in the banner (R2.22).
@@ -202,6 +207,21 @@ class Violation:
         )
 
 
+def key_of(message: Message) -> str:
+    """Return a message's key as text, for log lines about undecodable messages.
+
+    The key is the ``order_id`` (R1.10), so it identifies the order even when the value
+    is the thing that would not parse.
+    """
+    key = message.key()
+    if key is None:
+        return "<null>"
+    try:
+        return key.decode("utf-8")
+    except UnicodeDecodeError:
+        return "<undecodable-key>"
+
+
 def apply_event(
     current: OrderFold | None, event: LifecycleEvent
 ) -> tuple[OrderFold, list[Violation]]:
@@ -259,7 +279,11 @@ class ServiceConsumer:
     """Runs one service against the lifecycle topic."""
 
     def __init__(
-        self, spec: ServiceSpec, settings: Settings, store: StateStore
+        self,
+        spec: ServiceSpec,
+        settings: Settings,
+        store: StateStore,
+        router: FailureRouter,
     ) -> None:
         """Build a consumer for one service.
 
@@ -270,6 +294,9 @@ class ServiceConsumer:
                 here so ``main.py`` can fail on an unreachable database *before* this
                 consumer exists, and so the backend is one substitution rather than a
                 branch inside the loop.
+            router: Where a failed message goes (005 D3). Injected for the same reason
+                as ``store``, and shared with nothing — its producer belongs to this
+                process alone.
 
         Raises:
             ConsumerConfigError: If the settings are incompatible with the selected
@@ -281,6 +308,7 @@ class ServiceConsumer:
         self._group_id = settings.group_id_for(spec.name)
         self._instance = settings.instance_label
         self._store = store
+        self._router = router
         self._running = False
         self._consumer = Consumer(
             build_consumer_config(
@@ -439,28 +467,35 @@ class ServiceConsumer:
             "[%s/%s] consume error: %s", self._spec.name, self._instance, error
         )
 
+    @staticmethod
+    def _decode(message: Message) -> LifecycleEvent:
+        """Parse one message into an event.
+
+        Raises:
+            NonRetryableError: If the bytes are not UTF-8 JSON matching the event schema
+                (R5.2). Until 005 this branch logged and committed, dropping the message
+                silently; the bytes will never become valid, so the message is poison and
+                takes the same route a schema violation does (D2).
+        """
+        raw = message.value()
+        try:
+            return LifecycleEvent.model_validate(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError, AttributeError) as exc:
+            raise NonRetryableError(f"undecodable message: {exc}") from exc
+
     def _handle_message(self, message: Message) -> None:
         """Decode, detect, dispatch, and commit one message.
 
-        An unparseable message is logged and its offset committed anyway; stalling
-        here would block the partition for this service.
+        Any failure — a message that will not decode, or a handler that raises — leaves
+        through :meth:`_route_failure` instead of through the fold write, so the fold
+        never advances past work that did not happen (R5.11, D6).
         """
-        raw = message.value()
         key = message.key()
         partition = message.partition()
         try:
-            event = LifecycleEvent.model_validate(json.loads(raw.decode("utf-8")))
-        except (ValueError, UnicodeDecodeError) as exc:
-            logger.error(
-                "[%s/%s] undecodable message at %s[%d]@%d: %s",
-                self._spec.name,
-                self._instance,
-                message.topic(),
-                partition,
-                message.offset(),
-                exc,
-            )
-            self._commit(message)
+            event = self._decode(message)
+        except NonRetryableError as exc:
+            self._route_failure(message, exc, event=None)
             return
 
         # R1.42, R2.8 — service and instance first, so streams stay greppable.
@@ -494,15 +529,135 @@ class ServiceConsumer:
                 message.offset(),
             )
 
-        handler = self._spec.handlers.get(event.event_type)
-        if handler is not None:
-            handler(event)
+        # 005 — attempt 1, spent inline. A handler that succeeds here never touches the
+        # retry topic, which is why RETRY_MAX_ATTEMPTS counts this one (D8).
+        try:
+            failures.maybe_fail(self._settings, event, attempt=1)
+            handler = self._spec.handlers.get(event.event_type)
+            if handler is not None:
+                handler(event)
+        except StateStoreUnavailable:
+            # R3.22 — a dead state store stops the loop; it is not a message failure and
+            # must not be filed as one, or a database outage would fill the DLQ.
+            raise
+        except Exception as exc:  # noqa: BLE001 — classify() decides, not the type here
+            self._route_failure(message, exc, event=event)
+            return
 
         # R2.23 — the eviction lever (002 D9): sleep here and the commit below fails.
         if self._settings.handler_delay_seconds > 0:
             time.sleep(self._settings.handler_delay_seconds)
 
         self._persist_and_commit(message, event, updated, partition)
+
+    def _route_failure(
+        self, message: Message, exc: BaseException, *, event: LifecycleEvent | None
+    ) -> None:
+        """Send a failed message to the retry or dead-letter topic, then commit.
+
+        The commit is what makes the retry non-blocking (R5.7): the source partition
+        advances the moment the message is safely elsewhere, rather than when the retry
+        eventually succeeds. From here on a committed offset means "no longer ours",
+        not "processed" — the honest cost of not stalling, and 008's to remove.
+
+        The fold write is skipped entirely (R5.11), so the next event for this order
+        reports a real ``SEQUENCE_GAP``. That warning is correct: this service has not
+        processed the earlier event yet.
+
+        Args:
+            message: The message that failed.
+            exc: What went wrong.
+            event: The decoded event, or ``None`` when it was the decode that failed.
+        """
+        order_id = event.order_id if event is not None else key_of(message)
+        origin = Origin.from_message(message)
+        kind = classify(exc)
+        # Attempt 1 was spent inline whatever happens next.
+        retryable = kind is not NonRetryableError
+        budget_left = retryable and self._settings.retry_max_attempts > 1
+
+        try:
+            if not budget_left:
+                marker = "RETRY_EXHAUSTED" if retryable else "POISON_MESSAGE"
+                logger.warning(
+                    "[%s/%s] %s order_id=%s partition=%s offset=%s attempts=1 error=%s: %s",
+                    self._spec.name,
+                    self._instance,
+                    marker,
+                    order_id,
+                    origin.partition,
+                    origin.offset,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._router.to_dead_letter(
+                    message,
+                    origin=origin,
+                    service=self._spec.name,
+                    group_id=self._group_id,
+                    attempts_made=1,
+                    error=exc,
+                )
+                logger.warning(
+                    "[%s/%s] DLQ_PUBLISHED order_id=%s topic=%s",
+                    self._spec.name,
+                    self._instance,
+                    order_id,
+                    self._settings.dlq_topic,
+                )
+            else:
+                due_at = self._router.to_retry(
+                    message,
+                    origin=origin,
+                    service=self._spec.name,
+                    group_id=self._group_id,
+                    attempt=2,
+                    error=exc,
+                )
+                logger.warning(
+                    "[%s/%s] RETRY_SCHEDULED order_id=%s attempt=2 of %d due=%s error=%s: %s",
+                    self._spec.name,
+                    self._instance,
+                    order_id,
+                    self._settings.retry_max_attempts,
+                    due_at.isoformat(),
+                    type(exc).__name__,
+                    exc,
+                )
+        except FailurePublishFailed as publish_error:
+            # Nothing was moved, so nothing may be committed — committing here would drop
+            # the message on the floor, which is the one outcome this feature exists to
+            # prevent. Seek back so the next poll redelivers it and the attempt repeats.
+            # It will spin while the broker is unreachable; the marker is what makes the
+            # spin visible rather than silent (005 D3).
+            logger.error(
+                "[%s/%s] FAILURE_PUBLISH_FAILED order_id=%s offset=%s — not committing: %s",
+                self._spec.name,
+                self._instance,
+                order_id,
+                message.offset(),
+                publish_error,
+            )
+            self._rewind(message)
+            return
+
+        self._commit(message)
+
+    def _rewind(self, message: Message) -> None:
+        """Reset this partition's read position to redeliver ``message``."""
+        try:
+            self._consumer.seek(
+                TopicPartition(message.topic(), message.partition(), message.offset())
+            )
+        except KafkaException as exc:
+            logger.error(
+                "[%s/%s] could not rewind to %s@%s: %s",
+                self._spec.name,
+                self._instance,
+                message.partition(),
+                message.offset(),
+                exc,
+            )
 
     def _persist_and_commit(
         self,

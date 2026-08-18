@@ -17,6 +17,7 @@ from confluent_kafka import KafkaException
 
 from order_service.config import Settings, StateBackend, get_settings
 from order_service.consumer import analytics, inventory, notification
+from order_service.consumer.dlq import FailureRouter
 from order_service.consumer.runtime import (
     ConsumerConfigError,
     ServiceConsumer,
@@ -101,11 +102,16 @@ def main() -> None:
         logger.error("[%s] %s", spec.name, exc)
         sys.exit(2)
 
+    # 005 D3 — where a failed message goes. Built here alongside the store, for the same
+    # reason: one owner, constructed before the group is joined, closed in one place.
+    router = FailureRouter(settings)
+
     # R2.21 — a bad protocol/setting pair exits immediately; restarting will not help.
     try:
-        consumer = ServiceConsumer(spec, settings, store)
+        consumer = ServiceConsumer(spec, settings, store, router)
     except ConsumerConfigError as exc:
         logger.error("[%s] %s", spec.name, exc)
+        router.close()
         store.close()
         sys.exit(2)
 
@@ -125,6 +131,7 @@ def main() -> None:
         # Already logged with its marker in the consume loop (R3.22).
         sys.exit(1)
     finally:
+        router.close()
         store.close()
 
 

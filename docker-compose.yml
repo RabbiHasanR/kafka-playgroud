@@ -105,6 +105,19 @@ x-notification-env: &notification-env
   CONSUMER_ASSIGNMENT_STRATEGY: ${CONSUMER_ASSIGNMENT_STRATEGY:-}
   CONSUMER_REMOTE_ASSIGNOR: ${CONSUMER_REMOTE_ASSIGNOR:-}
 
+# --- spec 005: where a failed message goes --------------------------------------
+# Both topics are created by scripts/create_topics.sh. The retry topic is consumed by
+# the retry-worker and by nothing else; the dead-letter topic is consumed by NOTHING,
+# which is the whole of what makes it terminal (005 D10). If you ever find yourself
+# adding a service that subscribes to DLQ_TOPIC, that is the feature being undone.
+#
+# The failure lever (HANDLER_FAILURE_*) is deliberately NOT here. Like 002's
+# HANDLER_DELAY_SECONDS and 003's STATE_CRASH_AFTER it is set per-experiment on one
+# instance, not baked into the assembled system.
+x-failure-env: &failure-env
+  RETRY_TOPIC: ${RETRY_TOPIC:-order-lifecycle.retry}
+  DLQ_TOPIC: ${DLQ_TOPIC:-order-lifecycle.dlq}
+
 # --- spec 003: the durable state store, written once for all five consumers ------
 # STATE_BACKEND defaults to `memory` in config.py so a bare `python -m
 # order_service.consumer.main` still reproduces 001's and 002's recorded results
@@ -273,7 +286,7 @@ services:
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
-      <<: *state-db-env
+      <<: [*state-db-env, *failure-env]
     depends_on: *consumer-deps
 
   # --- spec 002: notification scales out ----------------------------------
@@ -293,7 +306,7 @@ services:
     <<: *notification-consumer
     container_name: notification-consumer-1
     environment:
-      <<: [*notification-env, *state-db-env]
+      <<: [*notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-1
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
 
@@ -302,7 +315,7 @@ services:
     container_name: notification-consumer-2
     profiles: ["scale-out"]
     environment:
-      <<: [*notification-env, *state-db-env]
+      <<: [*notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-2
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
 
@@ -311,7 +324,7 @@ services:
     container_name: notification-consumer-3
     profiles: ["scale-out"]
     environment:
-      <<: [*notification-env, *state-db-env]
+      <<: [*notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-3
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
@@ -324,7 +337,29 @@ services:
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
-      <<: *state-db-env
+      <<: [*state-db-env, *failure-env]
+    depends_on: *consumer-deps
+
+  # --- spec 005: the process that does the waiting ------------------------
+  # One container for all three services: every message on the retry topic names
+  # its service in x-service, so routing is a lookup against SERVICE_REGISTRY —
+  # the same table main.py builds the three consumers from (005 D1).
+  #
+  # It exists as a separate process for one reason: waiting out a backoff is the
+  # thing the three consume loops must never do. Nothing this container does can
+  # reach them.
+  #
+  # It sets no CONSUMER_GROUP_ID — that would collapse the three services' state
+  # stores onto one group id and merge memories that must stay separate (D5).
+  retry-worker:
+    <<: *consumer-image
+    container_name: retry-worker
+    command: python -m order_service.consumer.retry_worker
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      ORDER_LIFECYCLE_TOPIC: order-lifecycle
+      CONSUMER_INSTANCE_ID: retry-worker
+      <<: [*state-db-env, *failure-env]
     depends_on: *consumer-deps
 
 volumes:

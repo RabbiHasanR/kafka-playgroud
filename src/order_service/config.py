@@ -84,6 +84,28 @@ class ProducerAcks(StrEnum):
     ALL = "all"
 
 
+class HandlerFailureMode(StrEnum):
+    """How the failure lever makes handlers fail (005 D11).
+
+    ``TRANSIENT`` raises a retryable error until ``handler_failure_attempts`` has been
+    spent, then succeeds — which is what makes "attempt 2 recovered" observable rather
+    than asserted. ``POISON`` raises a non-retryable error every time, so the message
+    reaches the dead-letter topic having made exactly one attempt.
+
+    ``NONE`` is the default, so a consumer started without this lever behaves exactly as
+    004 recorded. This is 005's counterpart to 002's ``handler_delay_seconds`` and 003's
+    ``state_crash_after``.
+
+    A ``StrEnum`` for the same reason ``ProducerAcks`` is one: an unrecognised value must
+    fail at startup rather than quietly selecting "do not fail" and producing a run that
+    proves nothing.
+    """
+
+    NONE = "none"
+    TRANSIENT = "transient"
+    POISON = "poison"
+
+
 class Settings(BaseSettings):
     """Runtime settings resolved from the environment.
 
@@ -120,6 +142,23 @@ class Settings(BaseSettings):
             window (003 D5). Defaults to not crashing.
         producer_acks: How many replicas must acknowledge a write (004 D5). Defaults to
             ``all``, which is what the producer hardcoded before this setting existed.
+        retry_topic: Where a retryable failure waits out its backoff (005 D1). Consumed
+            by the retry worker alone — no service consumer subscribes to it.
+        dlq_topic: Where a message nothing could process ends up (005 D1). Consumed by
+            **nothing**; that is what makes it terminal (005 D10).
+        retry_max_attempts: Total attempts including the first, which the main consumer
+            spends inline (005 D8). 3 means one inline attempt and two in the worker.
+        retry_backoff_seconds: Comma-separated backoffs for the attempts *after* the
+            first. Parsed by :attr:`retry_backoff_schedule`.
+        producer_retries: How many times librdkafka retries a failed produce. Bounded in
+            practice by ``producer_message_timeout_ms``, which caps the total.
+        producer_message_timeout_ms: Total time a message may spend being retried before
+            the delivery report reports failure — librdkafka's spelling of the Java
+            client's ``delivery.timeout.ms`` (005 D12).
+        handler_failure_mode: The failure lever (005 D11). Defaults to not failing.
+        handler_failure_orders: Which order ids the lever applies to. Unset means every
+            order, which is rarely what you want — name the orders.
+        handler_failure_attempts: How many attempts ``transient`` fails before succeeding.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -149,6 +188,20 @@ class Settings(BaseSettings):
     # -- spec 004: the producer's half of the durability contract ---------------
     producer_acks: ProducerAcks = ProducerAcks.ALL
 
+    # -- spec 005: retries, the dead-letter topic, and the failure lever --------
+    retry_topic: str = "order-lifecycle.retry"
+    dlq_topic: str = "order-lifecycle.dlq"
+    retry_max_attempts: int = 3
+    retry_backoff_seconds: str = "30,120"
+
+    producer_retries: int = 3
+    producer_retry_backoff_ms: int = 100
+    producer_message_timeout_ms: int = 30_000
+
+    handler_failure_mode: HandlerFailureMode = HandlerFailureMode.NONE
+    handler_failure_orders: str | None = None
+    handler_failure_attempts: int = 2
+
     delivery_timeout_seconds: float = 10.0
 
     order_service_host: str = "0.0.0.0"
@@ -160,6 +213,7 @@ class Settings(BaseSettings):
         "consumer_remote_assignor",
         "consumer_instance_id_static",
         "state_db_dsn",
+        "handler_failure_orders",
         mode="before",
     )
     @classmethod
@@ -182,6 +236,47 @@ class Settings(BaseSettings):
     def instance_label(self) -> str:
         """Return this process's log identity, defaulting to the hostname (R2.7)."""
         return self.consumer_instance_id or socket.gethostname()
+
+    @property
+    def retry_backoff_schedule(self) -> list[float]:
+        """Return the backoff, in seconds, for each attempt after the first (R5.10).
+
+        Indexed by ``attempt - 2``: attempt 2 waits the first entry, attempt 3 the
+        second. A list shorter than ``retry_max_attempts`` reuses its last entry rather
+        than failing, so shortening the schedule cannot make the worker crash on an
+        attempt it has no number for.
+        """
+        parsed = [
+            float(part.strip())
+            for part in self.retry_backoff_seconds.split(",")
+            if part.strip()
+        ]
+        return parsed or [30.0]
+
+    def backoff_for_attempt(self, attempt: int) -> float:
+        """Return how long attempt ``attempt`` waits before it runs (R5.10).
+
+        Args:
+            attempt: The 1-based attempt being scheduled. Attempt 1 is spent inline by
+                the main consumer and never waits, so anything below 2 waits nothing.
+        """
+        if attempt < 2:
+            return 0.0
+        schedule = self.retry_backoff_schedule
+        return schedule[min(attempt - 2, len(schedule) - 1)]
+
+    @property
+    def failing_orders(self) -> frozenset[str]:
+        """Return the order ids the failure lever applies to (R5.19).
+
+        Empty means every order — which is why ``handler_failure_mode`` rather than this
+        is what turns the lever on.
+        """
+        if self.handler_failure_orders is None:
+            return frozenset()
+        return frozenset(
+            part.strip() for part in self.handler_failure_orders.split(",") if part.strip()
+        )
 
 
 @lru_cache

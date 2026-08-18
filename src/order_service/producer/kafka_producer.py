@@ -68,6 +68,17 @@ class LifecycleEventProducer:
                 # 004 D5: was hardcoded "all" from 001 until this feature made it a
                 # lever. The default is unchanged, so every earlier run is reproducible.
                 "acks": settings.producer_acks.value,
+                # 005 D12/R5.21 — the producer's own retry path, which until now was
+                # entirely librdkafka's defaults. It matters from this spec on because
+                # min.insync.replicas gives the broker a reason to REFUSE a write that
+                # acks=all alone would have accepted: NOT_ENOUGH_REPLICAS is retryable,
+                # and how long we keep trying is now a decision rather than a default.
+                "retries": settings.producer_retries,
+                "retry.backoff.ms": settings.producer_retry_backoff_ms,
+                # The binding one. It caps the TOTAL time including every retry, and is
+                # librdkafka's name for what the Java client calls delivery.timeout.ms —
+                # so `retries` alone cannot keep a message in flight past this.
+                "message.timeout.ms": settings.producer_message_timeout_ms,
                 # murmur2 on the key, as Java does: one order, one partition (R1.10).
                 "partitioner": "consistent_random",
                 "client.id": "order-service-producer",

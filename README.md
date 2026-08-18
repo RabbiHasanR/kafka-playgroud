@@ -443,7 +443,77 @@ Four things it demonstrates:
 
 | Gap | Closed by |
 |---|---|
-| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | 005, with the retry path a refusal needs |
-| Unclean leader election and deliberate committed-data loss | not scheduled; needs the row above first |
+| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | **closed by 005** — set to 2, with the producer retry path a refusal needs |
+| Unclean leader election and deliberate committed-data loss | not scheduled; the row above is now closed, so this is reachable |
 | What `acks` costs in latency, measured | needs a load generator, excluded from this ladder |
 | Replica placement, rack awareness, partition reassignment | never claimed |
+
+---
+
+# Spec 005 — Retries, the Dead-Letter Topic, and Poison Messages
+
+Until now a handler could not fail. `runtime.py` said so in the type it declared, and the one
+failure it did handle — a message that would not decode — was **logged and committed anyway**,
+because the alternative was stalling the partition forever. That is silent data loss, and it
+was the right call only because there was nowhere else to put the message.
+
+005 builds the somewhere else, and separates three things that used to look identical.
+
+Read [docs/retries-and-dlq.md](docs/retries-and-dlq.md). Full spec in
+[specs/005-retries-dlq-poison-messages/](specs/005-retries-dlq-poison-messages/requirements.md).
+
+```bash
+docker compose up -d --build              # no `down -v` this time
+./scripts/create_topics.sh                # adds the retry and dead-letter topics
+
+# a message that fails twice and then works
+ORDER=$(./scripts/place_orders.sh 1 | grep -oE 'ord-[a-z0-9-]+' | head -1)
+HANDLER_FAILURE_MODE=transient HANDLER_FAILURE_ORDERS=$ORDER \
+  docker compose up -d --force-recreate inventory-consumer
+docker compose logs -f inventory-consumer retry-worker \
+  | grep -E 'RETRY_SCHEDULED|RETRY_WAITING|RETRY_SUCCEEDED'
+
+# a message that can never work
+./scripts/produce_poison.sh               # not JSON at all
+./scripts/produce_poison.sh schema        # valid JSON, wrong shape
+
+# what gave up, and putting it back
+docker compose run --rm retry-worker python -m order_service.tools.dlq_replay
+docker compose run --rm retry-worker python -m order_service.tools.dlq_replay --publish
+```
+
+Four things it demonstrates:
+
+- **A transient failure and a poison message are opposites.** Retrying the first works;
+  retrying the second produces the identical exception and spends the budget proving it. So
+  classification comes first, and a poison message reaches the dead-letter topic having made
+  exactly **one** attempt, never touching the retry topic.
+- **In Kafka, giving up in place is not an option.** A partition is read in order, so a
+  consumer that keeps retrying offset 847 never commits past it and everything behind it waits.
+  The message has to *move*, not wait — which is why the source offset commits immediately.
+- **Non-blocking retry buys throughput with ordering.** While a message waits in the retry lane
+  the next event for the same order is folded ahead of it, and `SEQUENCE_GAP` fires. That
+  warning is correct — the service really has not processed the earlier event yet.
+- **Replay reaches every consumer group.** Republishing to `order-lifecycle` delivers to all
+  three groups, not only the one that failed. The two that already succeeded absorb it through
+  003's sequence guard and log `DUPLICATE_ABSORBED`.
+
+| Lever | What it causes |
+|---|---|
+| `HANDLER_FAILURE_MODE=transient` | fails `HANDLER_FAILURE_ATTEMPTS` attempts, then succeeds |
+| `HANDLER_FAILURE_MODE=poison` | fails every attempt, so the message is dead on arrival |
+| `scripts/produce_poison.sh` | genuinely malformed bytes, so the *decoder* fails rather than a handler |
+| `RETRY_BACKOFF_SECONDS=120,5` | a long-delayed message ahead of a short one, to watch the retry lane stall |
+| `MIN_INSYNC_REPLICAS=2` + `docker compose stop kafka-2 kafka-3` | a write the cluster refuses |
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| Head-of-line blocking in the retry lane — one topic, per-message delays | open by design; tiered delay topics are the fix, left unbuilt so the stall is watchable |
+| A committed offset no longer means "processed" | 008, where one transaction covers the publication and the commit |
+| `SEQUENCE_GAP` warnings while a retry is in flight | inherent to non-blocking retry; the honest signal, not noise |
+| Dead letters expire with the topic's default retention | never claimed; no criterion sets retention |
+| Nothing alerts on dead-letter depth | out of scope — a dead-letter topic nobody watches is a silent loss bucket |
+| Producer retries can reorder without `enable.idempotence` | 008 |
+| One worker means one service's backoff holds up the others' | accepted; the fix is a worker per service |

@@ -43,6 +43,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         settings.order_lifecycle_topic,
         settings.producer_acks.value,
     )
+    # 005 R5.21 — the producer's retry budget, on the same banner as acks for the same
+    # reason: with min.insync.replicas set, `acks=all` can now be REFUSED rather than
+    # merely slow, and how long the producer fought before giving up is the difference
+    # between reading a 503 as "the cluster is degraded" and as "the client gave up early".
+    logger.info(
+        "producer retry budget: retries=%d backoff_ms=%d message_timeout_ms=%d",
+        settings.producer_retries,
+        settings.producer_retry_backoff_ms,
+        settings.producer_message_timeout_ms,
+    )
     try:
         yield
     finally:
