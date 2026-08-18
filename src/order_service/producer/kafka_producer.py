@@ -44,8 +44,7 @@ class LifecycleEventProducer:
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
                 "acks": "all",
-                # murmur2 hash of the key, matching the Java client. Every event for
-                # one order therefore lands on one partition (R1.10).
+                # murmur2 on the key, as Java does: one order, one partition (R1.10).
                 "partitioner": "consistent_random",
                 "client.id": "order-service-producer",
             }
@@ -144,10 +143,7 @@ class LifecycleEventProducer:
         self._produce(event, on_delivery=on_delivery)
 
         if not done.wait(wait):
-            # librdkafka treats an unknown topic as retriable, so a missing topic
-            # surfaces as a plain timeout. R1.11 asks for an explicit error — but only
-            # when metadata actually says it is missing; a failing metadata call means
-            # an unreachable broker, which is a different fault.
+            # A missing topic looks like a timeout, so ask metadata which it was (R1.11).
             try:
                 topic_missing = not self.topic_exists()
             except KafkaException:

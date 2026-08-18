@@ -156,27 +156,9 @@ class MemoryStateStore:
         """Nothing to release."""
 
 
-#: The whole idempotency mechanism, in one statement (D6).
-#:
-#: The asymmetry is the design: the fold columns advance **only** when a higher sequence
-#: arrives, so a redelivery loses to itself and changes nothing (R3.11) and a full replay
-#: from earliest is a no-op (R3.12) — while ``handled_count`` increments **every** time,
-#: because it counts deliveries rather than advances (R3.13).
-#:
-#: One statement under autocommit is its own transaction, so there is no
-#: read-modify-write, no ``SELECT … FOR UPDATE``, no application lock, and no window for
-#: two members to interleave. The guard lives in the database, where concurrency is the
-#: database's problem — which is also what makes a write from an evicted zombie member
-#: harmless (D3).
-#: The ``previous`` CTE is what makes "did this advance?" answerable. Inside
-#: ``DO UPDATE`` the qualified name ``order_fold.last_sequence`` is the *old* value, but
-#: in ``RETURNING`` it is the *new* one, so the pre-write sequence is otherwise
-#: unreachable — and without it an exact redelivery (same sequence, ``GREATEST(n, n)``)
-#: is indistinguishable from a fresh apply. Every CTE in one statement sees the same
-#: snapshot, so ``previous`` reads the row as it stood before the upsert.
-#:
-#: It is still **one statement**, which is the part that matters: the guard stays atomic
-#: without a transaction, a row lock, or a read-modify-write.
+#: The whole idempotency mechanism, in one atomic statement (D6, D3): folds advance
+#: only on a higher sequence (R3.11, R3.12); handled_count counts each delivery (R3.13).
+#: The ``previous`` CTE carries the pre-write sequence, which ``RETURNING`` cannot.
 _UPSERT_FOLD = """
     WITH previous AS (
         SELECT last_sequence
@@ -337,10 +319,7 @@ class PostgresStateStore:
             raise StateStoreUnavailable(f"writing {order_id}: upsert returned no row")
 
         _stored_sequence, handled_count, previous_sequence = row
-        # "Applied" means the fold ADVANCED, not that the write succeeded. Comparing
-        # against the stored sequence instead would call an exact redelivery a fresh
-        # apply — GREATEST(n, n) is n, so the row looks untouched either way, and the
-        # one case this feature exists to detect would be the one it missed.
+        # "Applied" means the fold ADVANCED, not that the write succeeded.
         applied = fold.last_sequence > previous_sequence
         if applied:
             self._cache.setdefault(partition, {})[order_id] = fold

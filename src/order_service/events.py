@@ -38,8 +38,7 @@ class PaymentMethod(StrEnum):
     NAGAD = "NAGAD"
 
 
-#: The one legal predecessor state per event type (R1.5). ``None`` means "the order
-#: does not exist yet", so ORDER_CREATED is the only event legal for an unknown order.
+#: The one legal predecessor state per event type (R1.5); ``None`` means "no order yet".
 LEGAL_PREDECESSOR: dict[EventType, OrderState | None] = {
     EventType.ORDER_CREATED: None,
     EventType.PACKED: OrderState.CREATED,
@@ -55,8 +54,7 @@ RESULTING_STATE: dict[EventType, OrderState] = {
     EventType.DELIVERED: OrderState.DELIVERED,
 }
 
-#: Inverse of LEGAL_PREDECESSOR — which event a given state expects next. Derived, so
-#: the two cannot disagree. DELIVERED is absent: the chain ends there.
+#: Inverse of LEGAL_PREDECESSOR, derived so the two cannot disagree; DELIVERED ends it.
 EXPECTED_NEXT_EVENT: dict[OrderState | None, EventType] = {
     predecessor: event_type for event_type, predecessor in LEGAL_PREDECESSOR.items()
 }

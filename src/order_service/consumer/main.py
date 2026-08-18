@@ -36,8 +36,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("order_service.consumer")
 
-#: Every service this image can run, by ``SERVICE_NAME``. Factories rather than
-#: instances, so per-service state is created fresh per process, not at import time.
+#: Every service this image can run, by ``SERVICE_NAME``; factories, not instances.
 SERVICE_REGISTRY: dict[str, Callable[[], ServiceSpec]] = {
     inventory.SERVICE_NAME: inventory.build_service,
     notification.SERVICE_NAME: notification.build_service,
@@ -95,18 +94,14 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(2)
 
-    # R3.21 — before the Consumer exists, so a process that cannot honour R3.5 never
-    # joins the group. A member that joins and then dies has already cost a rebalance,
-    # and 002's whole point is that rebalances are not free.
+    # R3.21 — before the Consumer exists, so a doomed process never joins the group.
     try:
         store = build_store(settings, group_id=settings.group_id_for(spec.name))
     except StateStoreUnavailable as exc:
         logger.error("[%s] %s", spec.name, exc)
         sys.exit(2)
 
-    # R2.21 — an incompatible protocol/setting pair is a configuration error, so it
-    # exits like an unknown SERVICE_NAME does: immediately, without joining the group.
-    # Restarting will not help either of them.
+    # R2.21 — a bad protocol/setting pair exits immediately; restarting will not help.
     try:
         consumer = ServiceConsumer(spec, settings, store)
     except ConsumerConfigError as exc:
@@ -127,8 +122,7 @@ def main() -> None:
         logger.error("[%s] fatal kafka error: %s", spec.name, exc)
         sys.exit(1)
     except StateStoreUnavailable:
-        # Already logged with its marker in the consume loop (R3.22). Exiting non-zero
-        # rather than continuing is the point: see ServiceConsumer.run.
+        # Already logged with its marker in the consume loop (R3.22).
         sys.exit(1)
     finally:
         store.close()

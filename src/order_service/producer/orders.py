@@ -109,8 +109,7 @@ class OrderStore:
 
     def __init__(self) -> None:
         self._orders: dict[str, Order] = {}
-        # Route handlers run in FastAPI's worker threads, so every mutation and the
-        # transition check that precedes it happen under one lock.
+        # Handlers run in worker threads, so mutation and its check share one lock.
         self._lock = threading.Lock()
 
     def register(self, order_id: str, payload: OrderCreatedPayload) -> Order:

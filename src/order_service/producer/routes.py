@@ -230,8 +230,7 @@ def publish_event(
     if store.get(order_id) is None:
         raise HTTPException(status_code=404, detail=f"no order {order_id}")
 
-    # Before reserving, so a malformed request cannot burn a sequence number that the
-    # consumers would then report as a gap.
+    # Before reserving, so a bad request cannot burn a sequence number.
     try:
         validate_payload(body.event_type, body.payload)
     except ValueError as exc:

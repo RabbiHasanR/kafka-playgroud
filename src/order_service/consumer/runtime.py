@@ -54,8 +54,7 @@ logger = logging.getLogger(__name__)
 #: Raising is not part of the handler contract at this spec.
 Handler = Callable[[LifecycleEvent], None]
 
-#: What each protocol uses when the corresponding setting is left unset. Reported in
-#: the startup banner (R2.22) so a log excerpt carries its own configuration.
+#: What each protocol uses when its setting is left unset; shown in the banner (R2.22).
 DEFAULT_ASSIGNOR = {
     GroupProtocol.CLASSIC: "range (client default)",
     GroupProtocol.CONSUMER: "uniform (broker default)",
@@ -81,9 +80,7 @@ def validate_protocol_settings(settings: Settings) -> None:
     """
     protocol = settings.consumer_group_protocol
 
-    # Each entry is the offending value and the remedy for that specific setting —
-    # the two rejected under KIP-848 have different answers, and one hint for both
-    # would be wrong for whichever it was not written about.
+    # Each entry pairs the offending value with the remedy for that setting.
     if protocol is GroupProtocol.CONSUMER:
         incompatible = {
             "CONSUMER_ASSIGNMENT_STRATEGY": (
@@ -139,13 +136,11 @@ def build_consumer_config(
 
     config: dict[str, object] = {
         "bootstrap.servers": settings.kafka_bootstrap_servers,
-        # Its own group in 001 (fan-out, D7); in 002 the notification instances share
-        # one, and the same partitions divide between them instead.
+        # One group per service (D7); 002's notification instances share one.
         "group.id": group_id,
         # Committed by hand, after the handler runs (R1.32).
         "enable.auto.commit": False,
-        # No committed offsets means start at the earliest retained message, so a fresh
-        # group id replays the whole topic.
+        # No committed offsets means a fresh group id replays the whole topic.
         "auto.offset.reset": "earliest",
         "client.id": client_id,
         "group.protocol": protocol.value,
@@ -160,9 +155,7 @@ def build_consumer_config(
     elif settings.consumer_remote_assignor is not None:
         config["group.remote.assignor"] = settings.consumer_remote_assignor
 
-    # Accepted by both protocols. Lowering it is half the eviction lever (D9) — under
-    # classic the client also enforces max.poll.interval.ms >= session.timeout.ms, so
-    # the session timeout has to come down with it.
+    # Half the eviction lever (D9); under classic the session timeout drops with it.
     if settings.consumer_max_poll_interval_ms is not None:
         config["max.poll.interval.ms"] = settings.consumer_max_poll_interval_ms
 
@@ -224,8 +217,7 @@ def apply_event(
     violations: list[Violation] = []
 
     # -- sequence contiguity (R1.38) -------------------------------------------
-    # An unseen order has last_sequence 0, so anything but 1 is a gap — the same code
-    # path that fires after a restart, which is why the two are indistinguishable.
+    # An unseen order has last_sequence 0, so anything but 1 is a gap.
     expected_sequence = fold.last_sequence + 1
     if event.sequence != expected_sequence:
         violations.append(
@@ -319,10 +311,7 @@ class ServiceConsumer:
             KafkaException: If the broker reports a fatal error.
         """
         topic = self._settings.order_lifecycle_topic
-        # D5 — the callbacks log and manage folds; none of them assigns. Leaving the
-        # assignment to the client is what keeps one callback body correct under eager,
-        # cooperative, and KIP-848 alike, and it is what makes each partition resume
-        # from the group's last committed offset (R2.16).
+        # D5 — the callbacks only log and manage folds; the client assigns (R2.16).
         self._consumer.subscribe(
             [topic],
             on_assign=self._on_assign,
@@ -330,8 +319,7 @@ class ServiceConsumer:
             on_lost=self._on_lost,
         )
         self._running = True
-        # R2.22 — protocol and assignor in the banner, so a log excerpt pasted into a
-        # result carries the configuration it was produced under.
+        # R2.22 — protocol and assignor in the banner, so logs are self-describing.
         logger.info(
             "[%s/%s] consuming topic=%s group=%s brokers=%s handling=%s",
             self._spec.name,
@@ -350,10 +338,7 @@ class ServiceConsumer:
             self._settings.consumer_instance_id_static or "<dynamic>",
             self._settings.consumer_max_poll_interval_ms or "<client default>",
         )
-        # R3.23 — which backend produced this run's observations. Without it, an
-        # experiment run on the wrong backend is indistinguishable from one run on the
-        # right one, and the default being `memory` would be a trap rather than a
-        # compatibility guarantee (003 D8).
+        # R3.23 — which backend produced this run's observations (003 D8).
         logger.info(
             "[%s/%s] state_backend=%s write_order=%s crash_after=%s",
             self._spec.name,
@@ -373,12 +358,7 @@ class ServiceConsumer:
                     continue
                 self._handle_message(message)
         except StateStoreUnavailable as exc:
-            # R3.22 — the deliberate opposite of 002 D8, where a rejected commit is
-            # survived and consumption continues. A lost commit is a membership fact and
-            # the new owner redoes the work; a lost state store means R3.5 can no longer
-            # be honoured, and continuing would commit offsets for events whose state
-            # was never written — silently and permanently, which is exactly the failure
-            # R3.18 exists to warn about, arriving by accident.
+            # R3.22 — unlike a rejected commit, a dead state store must stop the loop.
             logger.error(
                 "[%s/%s] STATE_STORE_UNAVAILABLE backend=%s reason=%s",
                 self._spec.name,
@@ -392,10 +372,7 @@ class ServiceConsumer:
             logger.info("[%s] consumer closed", self._spec.name)
 
     # -- rebalance callbacks (D5) ---------------------------------------------------
-    # Logged at WARNING rather than INFO because R2.9 asks for a severity that separates
-    # them from ordinary record processing, and every consumed record is an INFO line.
-    # A rebalance is not an error; it is the one operational event worth interrupting
-    # the stream to notice.
+    # WARNING, not INFO: R2.9 wants these to stand out from per-record lines.
 
     def _on_assign(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
         """Log partitions gained. Does not assign — the client does (D5)."""
@@ -486,8 +463,7 @@ class ServiceConsumer:
             self._commit(message)
             return
 
-        # R1.42 and R2.8 — service name and instance first, so three interleaved log
-        # streams from one group stay readable by filtering alone.
+        # R1.42, R2.8 — service and instance first, so streams stay greppable.
         logger.info(
             "[%s/%s] partition=%d offset=%d key=%s order_id=%s seq=%d type=%s",
             self._spec.name,
@@ -500,25 +476,15 @@ class ServiceConsumer:
             event.event_type,
         )
 
-        # 003 — the fold is read from the store rather than from a dict on self. On the
-        # durable backend a miss reads through to Postgres, so a partition this member
-        # has never held still arrives with its history (R3.4, R3.8).
+        # 003 — from the store, so unheld partitions arrive with history (R3.4, R3.8).
         current = self._store.load(partition, event.order_id)
 
-        # D14 — a redelivery is not a violation. Durable memory makes an event we have
-        # already folded look like an *out of order* one: its sequence is behind the
-        # stored one, so apply_event() reports a gap and an illegal transition. Nothing
-        # was wrong with the data — we simply saw it twice, which at-least-once delivery
-        # is entitled to do. Reporting it under 001's VIOLATION marker would mean this
-        # feature removed one class of false positive and introduced another.
-        # The handler still runs and the delivery is still counted; only the *diagnosis*
-        # is suppressed (R3.6, R3.14).
+        # D14 — a redelivery is a repeat, not a violation (R3.6, R3.14).
         redelivered = current is not None and event.sequence <= current.last_sequence
 
         updated, violations = apply_event(current, event)
         for violation in [] if redelivered else violations:
-            # R1.41 — WARNING and a stable marker, so `grep VIOLATION` is the whole
-            # filtering story.
+            # R1.41 — WARNING and a stable marker, so `grep VIOLATION` suffices.
             logger.warning(
                 "[%s/%s] %s partition=%d offset=%d",
                 self._spec.name,
@@ -532,9 +498,7 @@ class ServiceConsumer:
         if handler is not None:
             handler(event)
 
-        # R2.23 — the eviction lever (002 D9). Placed after the handler and before the
-        # commit on purpose: a member that sleeps past `max.poll.interval.ms` is thrown
-        # out of the group here, so the commit below is the one that fails.
+        # R2.23 — the eviction lever (002 D9): sleep here and the commit below fails.
         if self._settings.handler_delay_seconds > 0:
             time.sleep(self._settings.handler_delay_seconds)
 
@@ -588,9 +552,7 @@ class ServiceConsumer:
         outcome = self._store.save(partition, event.order_id, fold, event.event_id)
         if outcome.applied:
             return
-        # The fold did not move, but the handler above already ran — the duplicate side
-        # effect was produced, not hidden. That is the half of the problem durable state
-        # does not fix, and `handled` is the number 008 exists to drive to zero.
+        # The fold did not move, but the handler already ran; 008 drives this to zero.
         logger.warning(
             "[%s/%s] DUPLICATE_ABSORBED order_id=%s seq=%d stored_seq=%d handled=%d",
             self._spec.name,
