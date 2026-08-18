@@ -29,7 +29,13 @@ PARTITIONS="${1:-3}"
 # while order-lifecycle at RF 3 carries on.
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-3}"
 CONTAINER="${KAFKA_CONTAINER:-kafka}"
-BOOTSTRAP="${KAFKA_INTERNAL_BOOTSTRAP:-localhost:9092}"
+# INTERNAL, not localhost:9092. This script always runs via `docker exec`, and inside a
+# container `localhost` is that container. Bootstrapping on the EXTERNAL listener makes the
+# broker hand back everyone's advertised EXTERNAL addresses (localhost:9094, localhost:9095),
+# which resolve to the wrong container and produce a wall of "node may not be available"
+# WARNs. Correct from the host, meaningless from inside. The INTERNAL addresses resolve via
+# compose DNS from any container, so the AdminClient reaches all three nodes.
+BOOTSTRAP="${KAFKA_INTERNAL_BOOTSTRAP:-kafka:19092}"
 
 # Every node, not just the one we exec into. A topic created at RF 3 while two brokers
 # are still starting fails with INVALID_REPLICATION_FACTOR — an error that reads like a
