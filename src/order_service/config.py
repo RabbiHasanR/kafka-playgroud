@@ -61,6 +61,29 @@ class StateCrashPoint(StrEnum):
     OFFSET_COMMIT = "offset_commit"
 
 
+class ProducerAcks(StrEnum):
+    """How many replicas must acknowledge a write before the producer calls it done
+    (004 D5).
+
+    ``NONE`` returns before the broker has confirmed anything, so a write lost in
+    flight is never reported. ``LEADER`` waits for the partition leader alone, which a
+    leader crash before replication can still lose. ``ALL`` waits for every replica
+    currently in the in-sync set.
+
+    ``ALL`` is the default and is what 001 through 003 ran with, hardcoded. Note what it
+    does *not* promise: with no ``min.insync.replicas`` set on the topic, an ISR that has
+    shrunk to one member still satisfies ``all`` (004 D8) — that gap is named in
+    docs/replication.md and closed at 005.
+
+    A ``StrEnum`` rather than a free string for the same reason ``GroupProtocol`` is one:
+    an unrecognised value must fail at startup, not select a silent fallback (R4.7).
+    """
+
+    NONE = "0"
+    LEADER = "1"
+    ALL = "all"
+
+
 class Settings(BaseSettings):
     """Runtime settings resolved from the environment.
 
@@ -68,8 +91,9 @@ class Settings(BaseSettings):
     (R2.34), so a consumer started with none of them set behaves exactly as it did.
 
     Attributes:
-        kafka_bootstrap_servers: ``localhost:9092`` from the host, ``kafka:19092``
-            from inside the compose network.
+        kafka_bootstrap_servers: All three brokers, so a client can still start while
+            any one node is down (004 D3, R4.11). ``localhost:9092,9094,9095`` from the
+            host; compose passes the ``kafka*:19092`` internal addresses.
         consumer_group_id: When unset it is derived from ``service_name``; set it to
             an unused value to replay the topic from earliest.
         consumer_instance_id: Per-process identity used only in log lines, so three
@@ -94,11 +118,13 @@ class Settings(BaseSettings):
             (003 D4). The default is the correct one; the other is a lever.
         state_crash_after: Where to kill the process on purpose, to open the dual-write
             window (003 D5). Defaults to not crashing.
+        producer_acks: How many replicas must acknowledge a write (004 D5). Defaults to
+            ``all``, which is what the producer hardcoded before this setting existed.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_bootstrap_servers: str = "localhost:9092,localhost:9094,localhost:9095"
     order_lifecycle_topic: str = "order-lifecycle"
 
     service_name: str = "inventory"
@@ -119,6 +145,9 @@ class Settings(BaseSettings):
     state_db_dsn: str | None = None
     state_write_order: StateWriteOrder = StateWriteOrder.STATE_FIRST
     state_crash_after: StateCrashPoint = StateCrashPoint.NONE
+
+    # -- spec 004: the producer's half of the durability contract ---------------
+    producer_acks: ProducerAcks = ProducerAcks.ALL
 
     delivery_timeout_seconds: float = 10.0
 

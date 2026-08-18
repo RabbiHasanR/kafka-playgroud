@@ -35,6 +35,28 @@ class DeliveryTimeout(Exception):
     """No delivery report arrived within the configured timeout (R1.18)."""
 
 
+def _describe_delivery_error(err: object, msg: object) -> str:
+    """Render a delivery-report error with the topic partition it applied to (R4.9).
+
+    Args:
+        err: The ``KafkaError`` handed to the delivery callback.
+        msg: The message the report is for. It carries the topic and partition even
+            when delivery failed, though the partition is ``UNASSIGNED`` if the failure
+            happened before one was chosen.
+
+    Returns:
+        A single line naming the error and, where known, its topic partition.
+    """
+    try:
+        topic = msg.topic()  # type: ignore[attr-defined]
+        partition = msg.partition()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        return str(err)
+    if topic is None or partition is None or partition < 0:
+        return f"{err} (partition not yet assigned)"
+    return f"{err} [{topic}-{partition}]"
+
+
 class LifecycleEventProducer:
     """Publishes lifecycle events keyed by ``order_id``."""
 
@@ -43,7 +65,9 @@ class LifecycleEventProducer:
         self._producer = Producer(
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
-                "acks": "all",
+                # 004 D5: was hardcoded "all" from 001 until this feature made it a
+                # lever. The default is unchanged, so every earlier run is reproducible.
+                "acks": settings.producer_acks.value,
                 # murmur2 on the key, as Java does: one order, one partition (R1.10).
                 "partitioner": "consistent_random",
                 "client.id": "order-service-producer",
@@ -132,7 +156,10 @@ class LifecycleEventProducer:
 
         def on_delivery(err: object, msg: object) -> None:
             if err is not None:
-                outcome["error"] = err
+                # R4.9: a bare str(err) on a degraded cluster says "Broker: Not enough
+                # in-sync replicas" and nothing about WHICH partition refused, which is
+                # the one fact a failover experiment needs (004 D7).
+                outcome["error"] = _describe_delivery_error(err, msg)
             else:
                 outcome["result"] = DeliveryResult(
                     partition=msg.partition(),  # type: ignore[attr-defined]

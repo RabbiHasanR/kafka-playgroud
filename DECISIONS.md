@@ -329,3 +329,79 @@ is going, but it silently invalidates 001's recorded results and one of this rep
 two reference documents. Also rejected: `classic` only, which would leave the environment's
 own `classic,consumer` broker setting unexplained and teach a protocol that Kafka 4.x is
 deprecating, with no sight of its replacement.
+
+---
+
+## X10 — The cluster becomes three brokers permanently; 000 is amended
+
+**Date:** 2026-08-18 **Status:** accepted **Specs:** 000, 004+, amends 000 R0.4 and R0.17
+
+**Context.** 004 needs more than one broker. The environment 000 built is a single KRaft
+node with every internal topic pinned to replication factor 1, and 001–003 were written
+against it. Two shapes were available: an opt-in overlay (`-f docker-compose.cluster.yml`)
+leaving 000's environment untouched, or growing `docker-compose.yml` itself.
+
+**Decision.** Three combined broker/controller nodes in `docker-compose.yml`, permanently.
+
+**Consequences.** The contrast that teaches replication is **RF 1 versus RF 3 on a topic**,
+not one broker versus three. Replication factor is a topic property, so a scratch topic at
+RF 1 on the three-broker cluster loses a partition when its node stops while
+`order-lifecycle` at RF 3 does not — both halves observable at once, which the overlay would
+have put one `docker compose` invocation apart. The overlay was protecting 000's text, not
+the lesson.
+
+Upgrading costs one `docker compose down -v` and a re-run of `create_topics.sh`. This is not
+avoidable by a compose profile: KRaft writes the controller quorum voters into the metadata
+log at format time, so a three-voter quorum with two nodes unstarted elects no controller and
+the cluster never starts. Three nodes or a re-format; "optional" is a fiction.
+
+001–003 stay reproducible — nothing they record depends on broker count. Group formation,
+assignment, rebalancing and the durable fold behave identically against three nodes. The
+running cost is three JVMs instead of one.
+
+**The amendment to 000.** Two criteria were contradicted and were reworded with the user's
+approval rather than rewritten:
+
+| | Was | Now |
+|---|---|---|
+| R0.4 | "run the broker and controller roles on a single node" | "…on every node" |
+| R0.17 | "set the replication factor of all internal topics to 1" | "…to the broker count" |
+
+R0.4's substance was always KRaft combined mode with no ZooKeeper, not the node count, so
+the reword restores its intent. R0.17 was pinned to 1 explicitly "so that single-broker
+operation does not fail" — that reason expired. Every other criterion in 000 is indifferent
+to broker count. 000's overview says which era it was written in.
+
+**Rejected.** The overlay file, for the reasons above. Also rejected: rewriting 000 to
+describe a three-broker cluster throughout, which would erase the single-node substrate that
+001–003 were built and recorded against.
+
+---
+
+## X11 — Specs are size-budgeted from 004 onward
+
+**Date:** 2026-08-18 **Status:** accepted **Specs:** 004+
+
+**Context.** The specs have grown monotonically: 000 is 262 lines across three files, 003 is
+987 — 30 acceptance criteria, a 501-line `design.md`, 231 lines of tasks. Each individual
+addition was defensible. The aggregate is a spec that is harder to hold in your head than the
+feature it describes, which inverts the reason for writing specs at all.
+
+**Decision.** From 004, each feature gets a budget: **roughly 12–15 acceptance criteria, a
+`design.md` under 200 lines, and roughly 12 tasks.** One companion document in `docs/`, whose
+length is not budgeted.
+
+**Consequences.** The budget forces a distinction the earlier specs blurred. A *criterion* is
+something that can be checked against the running system; a *rationale* is prose explaining
+why. 003 promoted a great deal of rationale into criteria and into `design.md` decisions. Under
+the budget that material goes to the `docs/` companion, where it is re-read, rather than to
+`requirements.md`, where it is approved once and then scanned past.
+
+Some depth is genuinely lost — 003's essays on the dual-write problem earned their length. The
+trade is accepted on the grounds that a spec nobody re-reads is not serving as a spec.
+
+Exceeding the budget is allowed and is not an error; it needs a sentence in `design.md` saying
+which part of the feature demanded it.
+
+**Rejected.** Retro-fitting the budget to 000–003 — they are the record of what was built and
+approved, and shrinking them now would rewrite history to match a rule made afterwards.

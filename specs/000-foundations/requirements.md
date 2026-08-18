@@ -5,16 +5,20 @@
 
 ## Overview
 
-A single-node Kafka broker running locally in Docker, reachable from both the host
-and other containers, with the full CLI toolset available for hands-on exploration
-of topics, partitions, keys, consumer groups, offsets, and log segments.
+A Kafka cluster running locally in Docker, reachable from both the host and other
+containers, with the full CLI toolset available for hands-on exploration of topics,
+partitions, keys, consumer groups, offsets, and log segments.
+
+It was a single node when this spec was written, and specs 001–003 were built against
+that. Spec 004 grew it to three nodes; R0.4 and R0.17 carry the amendment, and every
+other criterion here is unaffected by the broker count.
 
 This spec is the substrate every later feature builds on. It deliberately covers
 *environment*, not application behaviour.
 
 ## Out of scope
 
-- Multi-broker clusters, replication, failover (future spec)
+- Multi-broker clusters, replication, failover — **004**
 - Schema Registry, Kafka Connect, Kafka Streams (future spec)
 - Authentication, TLS, ACLs — this is a local learning environment on PLAINTEXT
 - Any Python client code (future spec)
@@ -50,7 +54,9 @@ behaviour instead of debugging silent no-ops.
   unhealthy until the broker answers an API-versions request.
 - **R0.3** — WHEN the broker has completed startup THE SYSTEM SHALL report container
   health as healthy within 60 seconds of `up`.
-- **R0.4** — THE SYSTEM SHALL run the broker and controller roles on a single node.
+- **R0.4** — THE SYSTEM SHALL run the broker and controller roles on every node.
+  *(amended by 004: was "on a single node". The criterion protects KRaft combined mode
+  with no ZooKeeper, not the node count — see [X10](../../DECISIONS.md).)*
 
 ### Connectivity
 
@@ -87,8 +93,10 @@ behaviour instead of debugging silent no-ops.
   SHALL give it 3 partitions.
 - **R0.16** — WHEN a consumer group forms THE SYSTEM SHALL complete the initial
   rebalance without an artificial delay.
-- **R0.17** — THE SYSTEM SHALL set the replication factor of all internal topics to 1,
-  so that single-broker operation does not fail on under-replication.
+- **R0.17** — THE SYSTEM SHALL set the replication factor of all internal topics to the
+  broker count, so that operation does not fail on under-replication.
+  *(amended by 004: was pinned to 1 for single-broker operation — see
+  [X10](../../DECISIONS.md).)*
 
 ### Documentation
 

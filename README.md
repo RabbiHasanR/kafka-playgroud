@@ -1,14 +1,19 @@
 # Kafka Playground
 
-Single-broker Kafka 4.3.1 in KRaft mode (no ZooKeeper) for hands-on CLI learning.
+A three-broker Kafka 4.3.1 cluster in KRaft mode (no ZooKeeper) for hands-on CLI learning.
+It was a single node through spec 003; [spec 004](specs/004-replication-acks-failover/requirements.md)
+grew it to three.
 
 | What | Where |
 |---|---|
-| Broker (from host) | `localhost:9092` |
-| Broker (from other containers) | `kafka:19092` |
+| Brokers (from host) | `localhost:9092`, `localhost:9094`, `localhost:9095` |
+| Brokers (from other containers) | `kafka:19092`, `kafka-2:19092`, `kafka-3:19092` |
 | Kafka UI | http://localhost:8080 |
-| CLI tools | `/opt/kafka/bin/` inside the `kafka` container |
-| Log segments on disk | `/var/lib/kafka/data/` inside the container |
+| CLI tools | `/opt/kafka/bin/` inside any broker container |
+| Log segments on disk | `/var/lib/kafka/data/` inside each container |
+
+Node ids are 1, 2, 3; the container names are `kafka`, `kafka-2`, `kafka-3`. The first keeps
+its original name so every `docker exec kafka …` below still works.
 
 ## Lifecycle
 
@@ -19,6 +24,11 @@ docker compose logs -f kafka  # broker logs
 docker compose down           # stop, keep data
 docker compose down -v        # stop, WIPE all topics/messages
 ```
+
+**Upgrading from the single-broker era needs `down -v` once.** KRaft writes the controller
+quorum into the metadata log at format time, so the old one-voter volume cannot grow into a
+three-voter cluster. Run `docker compose down -v && docker compose up -d && ./scripts/create_topics.sh`.
+See [docs/replication.md §6](docs/replication.md).
 
 Get a shell inside the broker — most commands below assume you're here:
 
@@ -306,7 +316,7 @@ Four things it demonstrates:
 | A moved partition loses its fold → false `SEQUENCE_GAP` | 003, fully by 007 |
 | Rebalance duration and consumer lag are never measured | needs a load generator, excluded here |
 | Partition growth and key rehashing | a topic-level lesson, not a consumer-group one |
-| Single broker, RF 1 | 004 |
+| Single broker, RF 1 | **closed by 004** |
 
 ---
 
@@ -382,3 +392,58 @@ editing the schema and running `up` again does nothing at all, silently.
 | Shared database, not state co-partitioned with the input | 007 |
 | Rebuild cost grows with history, not with key count | 007 |
 | The producer's own `OrderStore` is still in memory | transactional outbox; no spec claims it |
+
+
+---
+
+# Spec 004 — Replication, `acks`, and Failover
+
+001, 002 and 003 were all consumer-side lessons running on **one copy of every message**.
+Stopping the broker was never an experiment because everything stopped at once. 004 makes the
+cluster three nodes, gives every partition three replicas, and turns the producer's `acks` —
+hardcoded to `all` since 001 — into one environment variable.
+
+Read [docs/replication.md](docs/replication.md). Full spec in
+[specs/004-replication-acks-failover/](specs/004-replication-acks-failover/requirements.md).
+
+```bash
+docker compose down -v                    # required once, coming from a single-broker volume
+docker compose up -d --build
+./scripts/create_topics.sh                # RF 3 by default now
+
+# leader, replicas, and the in-sync set — three different facts
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic order-lifecycle
+
+./scripts/place_orders.sh 5 --advance
+docker stop kafka-2                       # a leader dies
+./scripts/place_orders.sh 5 --advance     # the producer never noticed
+docker start kafka-2                      # Isr returns to three
+```
+
+Four things it demonstrates:
+
+- **The ISR is the number that moves.** `Replicas` is fixed at topic creation and does not
+  change when a broker dies. `Isr` shrinks within seconds and grows back on restart.
+- **Failover needs no operator.** The controller elects a new leader from the ISR and
+  librdkafka refreshes its metadata onto it. Nothing restarts, nothing is reconfigured.
+- **Replication belongs to the topic, not the cluster.** An RF 1 topic on a healthy
+  three-broker cluster still loses a partition when its one node stops, while `order-lifecycle`
+  at RF 3 beside it carries on.
+- **`acks=all` does not mean all replicas.** It means all replicas *currently in sync* — and an
+  ISR that has shrunk to one member satisfies it completely.
+
+| Lever | What it causes |
+|---|---|
+| `PRODUCER_ACKS=0` | the producer returns before the broker confirms anything, and never reports a loss |
+| `PRODUCER_ACKS=1` | the leader's log only — a leader crash before replication still loses the write |
+| `REPLICATION_FACTOR=1` | an under-replicated topic, to lose a partition on purpose |
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | 005, with the retry path a refusal needs |
+| Unclean leader election and deliberate committed-data loss | not scheduled; needs the row above first |
+| What `acks` costs in latency, measured | needs a load generator, excluded from this ladder |
+| Replica placement, rack awareness, partition reassignment | never claimed |

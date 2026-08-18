@@ -10,6 +10,68 @@
 # two members of one group running different specs, with only a missing banner line to
 # show for it. One tag makes a stale member impossible, and makes the Dockerfile's
 # opening claim ("one image for the order service and all three consumers") true.
+# --- spec 004: three brokers, one KRaft cluster ---------------------------------
+# The three nodes differ only in node id, hostname, advertised EXTERNAL address, host
+# port and volume. Everything else is written once here (004 D1), the way
+# x-consumer-image below already does for the five application containers.
+#
+# `deploy.replicas` was rejected for the same reason 002 rejected `--scale`: it forbids
+# container_name, and the whole point of this feature is `docker stop kafka-2`.
+#
+# The first node keeps container_name `kafka` (004 D2). Renaming it to kafka-1 for
+# symmetry would break every `docker exec kafka …` in README.md and create_topics.sh.
+x-kafka-broker: &kafka-broker
+  image: apache/kafka:4.3.1
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 10
+    start_period: 20s
+
+x-kafka-env: &kafka-env
+  # --- KRaft: every node is both controller and broker (000 R0.4, as amended by 004) ---
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  # All three nodes are voters. This is written into the metadata log when a node
+  # formats its volume, which is why growing an existing single-node cluster is not
+  # possible and the upgrade costs one `docker compose down -v` (004 D9).
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093,2@kafka-2:9093,3@kafka-3:9093
+
+  # --- Listeners ---
+  # Shared, because each container binds these inside its OWN network namespace:
+  # INTERNAL  -> other containers reach this node at <hostname>:19092
+  # EXTERNAL  -> the host reaches it at localhost:<published port>
+  # CONTROLLER-> quorum traffic only, never published
+  # Only KAFKA_ADVERTISED_LISTENERS differs per node, and it is set on each service.
+  KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+  # --- Internal topics are replicated across all three nodes (004 R4.2) ---
+  # These were pinned to 1 by the single-broker environment 000 built; R0.17 there is
+  # amended to "the broker count". min ISR 2 on the transaction state log is the
+  # standard pairing with RF 3 — it tolerates one node down and refuses at two.
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
+
+  # --- Learning-friendly tweaks ---
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # force explicit topic creation
+  KAFKA_NUM_PARTITIONS: 3
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # groups form instantly
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  CLUSTER_ID: kafka-playground-cluster-01
+
+# Every client is told about all three brokers (004 D3, R4.11). One address is enough to
+# discover the cluster from metadata — but if that one address is the node that is down,
+# the client cannot START, and the failure reads as broken failover rather than as a
+# bootstrap list of one. That is the whole reason this is an anchor and not a literal.
+x-kafka-bootstrap: &kafka-bootstrap "kafka:19092,kafka-2:19092,kafka-3:19092"
+
 x-consumer-image: &consumer-image
   build: .
   image: kafka-playground:local
@@ -20,11 +82,15 @@ x-notification-consumer: &notification-consumer
   depends_on: &consumer-deps
     kafka:
       condition: service_healthy
+    kafka-2:
+      condition: service_healthy
+    kafka-3:
+      condition: service_healthy
     postgres:
       condition: service_healthy
 
 x-notification-env: &notification-env
-  KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+  KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
   ORDER_LIFECYCLE_TOPIC: order-lifecycle
   SERVICE_NAME: notification
   # One group id across all three — this is the whole feature.
@@ -63,49 +129,53 @@ x-state-db-env: &state-db-env
   STATE_DB_DSN: postgresql://${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
 
 services:
+  # --- spec 004: the three-broker cluster ---------------------------------
+  # Node ids 1/2/3; hostnames kafka, kafka-2, kafka-3 (asymmetric on purpose, D2).
+  # Everything shared lives in x-kafka-broker / x-kafka-env at the top of this file.
+  #
+  # Host ports 9092 / 9094 / 9095 all map to each container's own EXTERNAL 9092.
+  # 9093 is the controller listener INSIDE each container and is never published.
+  #
+  # After changing the quorum, the old single-voter volumes cannot be reused:
+  #   docker compose down -v && docker compose up -d && ./scripts/create_topics.sh
   kafka:
-    image: apache/kafka:4.3.1
+    <<: *kafka-broker
     container_name: kafka
     hostname: kafka
     ports:
       - "9092:9092"   # host clients (python, etc.)
     environment:
-      # --- KRaft: this node is both controller and broker (no ZooKeeper) ---
+      <<: *kafka-env
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-
-      # --- Listeners ---
-      # INTERNAL  -> other containers reach the broker at kafka:19092
-      # EXTERNAL  -> your host reaches the broker at localhost:9092
-      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-
-      # --- Single-broker musts: internal topics can't replicate beyond 1 ---
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
-
-      # --- Learning-friendly tweaks ---
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # force explicit topic creation
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0  # groups form instantly
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      CLUSTER_ID: kafka-playground-cluster-01
-
     volumes:
       - kafka-data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 20s
+
+  kafka-2:
+    <<: *kafka-broker
+    container_name: kafka-2
+    hostname: kafka-2
+    ports:
+      - "9094:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:19092,EXTERNAL://localhost:9094
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *kafka-broker
+    container_name: kafka-3
+    hostname: kafka-3
+    ports:
+      - "9095:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:19092,EXTERNAL://localhost:9095
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
 
   # --- spec 003: the durable consumer state store -------------------------
   # Holds order_fold ONLY — the consumers' derived memory. The producer's
@@ -150,10 +220,14 @@ services:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: playground
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: *kafka-bootstrap
       DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       kafka:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
 
   # --- spec 001: prepaid order service + consumer fan-out -----------------
@@ -178,12 +252,16 @@ services:
     ports:
       - "8010:8010"
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       ORDER_SERVICE_HOST: 0.0.0.0
       ORDER_SERVICE_PORT: 8010
     depends_on:
       kafka:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
 
   inventory-consumer:
@@ -191,7 +269,7 @@ services:
     container_name: inventory-consumer
     command: python -m order_service.consumer.main
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
@@ -242,7 +320,7 @@ services:
     container_name: analytics-consumer
     command: python -m order_service.consumer.main
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
@@ -251,4 +329,6 @@ services:
 
 volumes:
   kafka-data:
+  kafka2-data:
+  kafka3-data:
   postgres-data:

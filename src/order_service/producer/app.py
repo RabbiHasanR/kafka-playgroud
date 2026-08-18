@@ -33,10 +33,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.producer = producer
     app.state.orders = OrderStore()
 
+    # 004 D6/R4.8: acks is a PRODUCER setting and meaningless on a consumer, so it goes
+    # in this banner rather than the consumer banner R3.23 established. Without it, a run
+    # at acks=0 is indistinguishable in the logs from a run at acks=all — and the whole
+    # point of the lever is comparing two runs after the fact.
     logger.info(
-        "order service ready: brokers=%s topic=%s",
+        "order service ready: brokers=%s topic=%s acks=%s",
         settings.kafka_bootstrap_servers,
         settings.order_lifecycle_topic,
+        settings.producer_acks.value,
     )
     try:
         yield
