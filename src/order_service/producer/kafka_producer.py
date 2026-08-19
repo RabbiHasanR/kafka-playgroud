@@ -150,7 +150,8 @@ class LifecycleEventProducer:
         Args:
             event: The event to publish.
             timeout: Seconds to wait for the delivery report. Defaults to the
-                configured ``delivery_timeout_seconds``.
+                ``producer_delivery_wait_seconds``, which tracks the producer's
+                own ``message.timeout.ms`` so the caller never gives up first.
 
         Returns:
             The partition and offset the broker assigned.
@@ -159,8 +160,13 @@ class LifecycleEventProducer:
             DeliveryFailed: If the broker reported an error, or the topic is missing.
             DeliveryTimeout: If no delivery report arrived in time.
         """
+        # 005 D12: derived from message.timeout.ms, NOT the 10s delivery_timeout_seconds
+        # this used to read. Giving up before librdkafka does turns every slow delivery
+        # into a ghost write and hides the NOT_ENOUGH_REPLICAS report R5.22 asks for.
         wait = (
-            timeout if timeout is not None else self._settings.delivery_timeout_seconds
+            timeout
+            if timeout is not None
+            else self._settings.producer_delivery_wait_seconds
         )
         done = threading.Event()
         outcome: dict[str, object] = {}

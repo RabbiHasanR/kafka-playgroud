@@ -206,8 +206,24 @@ it bounds the *total* time including retries, and is librdkafka's spelling of th
 until that timeout, then surfaces through 004 D7's delivery-failure path, which already names the
 partition. The banner line joins R4.8's `acks` line in `producer/app.py`, for 004 D6's reason.
 
+**The caller's wait is derived from `message.timeout.ms`, not configured separately.** As first
+built, `publish_and_wait` blocked for `delivery_timeout_seconds` (10s) while librdkafka retried for
+30s. Two consequences, both defects: the delivery report naming `NOT_ENOUGH_REPLICAS` and its
+partition arrived *after* the route had already returned, so R5.22 was not actually met — an ISR
+refusal surfaced as a `504` (we gave up) rather than a `502` (the cluster refused); and a write
+landing at t=20s was a **ghost**, acknowledged by the broker after the caller was told it failed.
+`Settings.producer_delivery_wait_seconds` now returns `producer_message_timeout_ms / 1000 + 1.0`,
+so the caller outlives the producer's own budget by construction. Lowering `message.timeout.ms` to
+meet the old 10s would not have worked: `request.timeout.ms` is librdkafka's 30s default and is
+never set here, so one in-flight request can outlive a shorter message deadline and reopen the
+window a layer down. `FailureRouter` deliberately keeps the short `delivery_timeout_seconds` — it
+publishes from inside a consume loop, where a 31s block would eat `max.poll.interval.ms`.
+
 **Producer retries can reorder.** Without `enable.idempotence`, a retried batch can land behind a
-later one. Named in the document and left to 008, which is where idempotent production belongs.
+later one. Named in the document and left to 008, which is where idempotent production belongs. The
+same gap leaves one ghost irreducible: a broker that writes the message and then loses the
+acknowledgement is reported as a failure while the write stands. No timeout closes that; producer
+ids and sequence numbers do.
 
 ### D13 — Defaults preserve 004, with one stated exception — *R5.23*
 

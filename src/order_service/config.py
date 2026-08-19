@@ -238,6 +238,30 @@ class Settings(BaseSettings):
         return self.consumer_instance_id or socket.gethostname()
 
     @property
+    def producer_delivery_wait_seconds(self) -> float:
+        """Return how long a caller blocks for a delivery report (R5.22).
+
+        Derived from ``producer_message_timeout_ms`` rather than configured
+        independently, because the two are the same deadline seen from opposite
+        sides. A caller that gives up *first* is told the write failed while
+        librdkafka is still retrying it, so a message landing after that is a ghost
+        write nobody is listening for — and the delivery report naming
+        ``NOT_ENOUGH_REPLICAS`` and its partition arrives after the 504 has already
+        gone out. Waiting out the producer's own budget means the caller sees the
+        broker's reason instead of our impatience.
+
+        Lowering ``message.timeout.ms`` instead would not work: ``request.timeout.ms``
+        is librdkafka's 30s default and is never set here, so a single in-flight
+        request can outlive a shorter message deadline and reopen the same window one
+        layer down.
+
+        Returns:
+            The message timeout in seconds, plus a second of slack for the callback
+            to be serviced by the poll thread.
+        """
+        return self.producer_message_timeout_ms / 1000 + 1.0
+
+    @property
     def retry_backoff_schedule(self) -> list[float]:
         """Return the backoff, in seconds, for each attempt after the first (R5.10).
 
