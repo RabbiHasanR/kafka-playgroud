@@ -89,6 +89,14 @@ class StateStore(Protocol):
         """
         ...
 
+    def delete(self, partition: int, order_id: str) -> bool:
+        """Erase one order's fold entirely, and report whether there was one.
+
+        Distinct from :meth:`forget`, which releases a *partition* without destroying
+        anything durable. This is the durable delete a tombstone asks for (R6.10).
+        """
+        ...
+
     def forget(self, partitions: Iterable[int]) -> None:
         """Release in-process state for exactly these partitions."""
         ...
@@ -137,6 +145,16 @@ class MemoryStateStore:
         self._handled[(partition, order_id)] = handled
         return SaveOutcome(applied=True, handled_count=handled)
 
+    def delete(self, partition: int, order_id: str) -> bool:
+        """Drop one order's fold and its delivery count (R6.10).
+
+        Returns:
+            ``True`` if a fold was actually removed.
+        """
+        removed = self._folds.get(partition, {}).pop(order_id, None)
+        self._handled.pop((partition, order_id), None)
+        return removed is not None
+
     def forget(self, partitions: Iterable[int]) -> None:
         """Forget everything about these partitions (R2.14).
 
@@ -184,6 +202,14 @@ _UPSERT_FOLD = """
            upserted.handled_count,
            COALESCE(previous.last_sequence, 0) AS previous_sequence
       FROM upserted LEFT JOIN previous ON true
+"""
+
+#: A tombstone's durable half (006 D6). A real DELETE, not a flag: the row that
+#: compaction erased from the topic must not survive in the table, or "deleted" stops
+#: meaning deleted in the one place this feature is about.
+_DELETE_FOLD = """
+    DELETE FROM order_fold
+     WHERE group_id = %(group_id)s AND order_id = %(order_id)s
 """
 
 _SELECT_FOLD = """
@@ -324,6 +350,37 @@ class PostgresStateStore:
         if applied:
             self._cache.setdefault(partition, {})[order_id] = fold
         return SaveOutcome(applied=applied, handled_count=handled_count)
+
+    def delete(self, partition: int, order_id: str) -> bool:
+        """Delete one order's row and evict it from the cache (R6.10).
+
+        Note the contrast with :meth:`forget` directly below: that one drops the cache and
+        deliberately issues no ``DELETE``, because a rebalance must not destroy a memory.
+        This one is the opposite — a tombstone is an instruction to destroy it.
+
+        Args:
+            partition: The partition whose cache slot holds this order.
+            order_id: The order to erase.
+
+        Returns:
+            ``True`` if a row was actually deleted. ``False`` means the tombstone arrived
+            for an order this group had never folded, which is normal on a replay and is
+            not an error.
+
+        Raises:
+            StateStoreUnavailable: If the delete fails.
+        """
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.execute(
+                    _DELETE_FOLD, {"group_id": self._group_id, "order_id": order_id}
+                )
+                deleted = cursor.rowcount
+        except psycopg.Error as exc:
+            raise StateStoreUnavailable(f"deleting {order_id}: {exc}") from exc
+
+        self._cache.get(partition, {}).pop(order_id, None)
+        return deleted > 0
 
     def forget(self, partitions: Iterable[int]) -> None:
         """Drop the cache for these partitions, and issue no ``DELETE`` (R3.9).

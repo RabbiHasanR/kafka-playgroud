@@ -405,3 +405,46 @@ which part of the feature demanded it.
 
 **Rejected.** Retro-fitting the budget to 000–003 — they are the record of what was built and
 approved, and shrinking them now would rewrite history to match a rule made afterwards.
+
+---
+
+## X12 — `order-snapshot` is the table, and is what 007 will rebuild state from
+
+**Date:** 2026-08-19 **Status:** accepted **Specs:** 006, 007, cites X5
+
+**Context.** 006 needs a compacted topic, and 007 (X5)
+needs a compacted changelog to rebuild a local state store from. These are the same topic,
+introduced one rung before the rung that consumes it — so the decision spans two features and
+belongs here rather than in either `design.md`, per this file's routing rule.
+
+**Decision.** `order-snapshot`: `cleanup.policy=compact`, keyed by `order_id`, co-partitioned
+with `order-lifecycle`, carrying one self-contained snapshot per order and tombstones for
+deletes. The order service writes it; the three consumers read it for its tombstones only.
+
+**Consequences.** `order-lifecycle` stays `cleanup.policy=delete` permanently. This is not a
+deferral — compacting an event log is destructive, because an order is four messages under one
+key and each is an increment rather than a replacement. Compaction would keep only the newest,
+leaving a `DELIVERED` event with no creation behind it and breaking every 001–005 experiment
+that replays from earliest. The distinction between a log and a table is the reason there are
+two topics, and it does not go away at 007.
+
+Co-partitioning is load-bearing from here on. Equal partition counts plus one key and one
+partitioner mean order X's snapshot and order X's events share a partition *number*, which is
+what makes the consumers' partition-keyed fold cache correct and what 007's co-partitioned
+state store and 009's joins both require. `scripts/create_topics.sh` passes one partition count
+to both topics for that reason; splitting them would evict the wrong orders, silently.
+
+At 006 this topic is **written but not read for state** — the fold's only source is still the
+event log, and R6.12 says so explicitly to stop the implementation drifting into 007 early.
+That leaves the fold derived from two topics with independent retention, which is why a deleted
+order can be resurrected by a replay, a pending retry, or a DLQ replay. All three are recorded
+as open in 006 and close at 007, where the changelog becomes the single source.
+
+**Rejected.** Introducing the compacted topic at 007 alongside RocksDB — it would put
+compaction, tombstones, a local store and a rebuild path in one rung, and the tombstone would
+arrive as machinery rather than as the answer to "how do I delete an order?". Also rejected:
+an `ORDER_DELETED` lifecycle event instead of a tombstone, which would keep deletes on the log
+where replays already see them, but needs a new `EventType`, a terminal `OrderState` and a
+`LEGAL_PREDECESSOR` table that can express "from any state" — a change to the shared event
+contract that 006 is too small to justify. It remains available to 007 if the changelog rebuild
+turns out to want it.

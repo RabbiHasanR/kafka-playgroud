@@ -72,6 +72,23 @@ class Order:
     state: OrderState
     last_sequence: int
 
+    def as_snapshot(self) -> dict[str, object]:
+        """Return this order as one self-contained value for the compacted topic (R6.4).
+
+        Built on :meth:`as_dict` so the HTTP view and the snapshot cannot drift apart.
+
+        **Self-containment is a requirement here, not a convenience.** Compaction retains
+        only the newest value per key and discards every earlier one, so a consumer may
+        legitimately see this message and nothing else about the order — no creation, no
+        intervening events. Everything needed to know the order must therefore be in this
+        single dict. Trimming it to ``{state}`` would halve the bytes and destroy the
+        property the compacted topic exists to demonstrate (006 D2).
+
+        Returns:
+            The order's complete current state, JSON-serialisable.
+        """
+        return self.as_dict()
+
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable view of this order, enums as strings (R1.27)."""
         return {
@@ -142,6 +159,30 @@ class OrderStore:
         """Return one order, or ``None`` if it is unknown."""
         with self._lock:
             return self._orders.get(order_id)
+
+    def remove(self, order_id: str) -> Order:
+        """Forget one order entirely (R6.8).
+
+        Called only *after* the tombstone has been acknowledged by the broker, mirroring
+        :meth:`register`, which records an order only after its creation event lands. The
+        ordering is what keeps a failed delete retryable: an order dropped here while the
+        tombstone never reached the topic would be gone locally and still present in every
+        consumer's fold, with nothing left to re-drive the delete from (006 D4).
+
+        Args:
+            order_id: The order to forget.
+
+        Returns:
+            The order as it was immediately before removal.
+
+        Raises:
+            UnknownOrder: If no such order exists.
+        """
+        with self._lock:
+            order = self._orders.pop(order_id, None)
+            if order is None:
+                raise UnknownOrder(f"no order {order_id}")
+            return order
 
     def reserve(
         self, order_id: str, event_type: EventType, *, force: bool = False

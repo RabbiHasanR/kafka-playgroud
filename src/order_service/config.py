@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     (R2.34), so a consumer started with none of them set behaves exactly as it did.
 
     Attributes:
+        order_snapshot_topic: The compacted topic carrying one self-contained snapshot
+            per order, and the tombstones that delete them (006 D1). Separate from
+            ``order_lifecycle_topic`` because compaction retains only the newest value
+            per key — safe for a snapshot that *replaces* its predecessor, ruinous for
+            an event that *adds* to it. The cleaner's own settings are not here: they
+            are topic config, applied by ``scripts/create_topics.sh``.
         kafka_bootstrap_servers: All three brokers, so a client can still start while
             any one node is down (004 D3, R4.11). ``localhost:9092,9094,9095`` from the
             host; compose passes the ``kafka*:19092`` internal addresses.
@@ -165,6 +171,9 @@ class Settings(BaseSettings):
 
     kafka_bootstrap_servers: str = "localhost:9092,localhost:9094,localhost:9095"
     order_lifecycle_topic: str = "order-lifecycle"
+
+    # -- spec 006: the compacted table beside the event log ---------------------
+    order_snapshot_topic: str = "order-snapshot"
 
     service_name: str = "inventory"
     consumer_group_id: str | None = None

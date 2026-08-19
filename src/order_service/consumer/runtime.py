@@ -15,6 +15,12 @@ the difference is one environment variable (003 D2, D8).
 With the durable store the two writes go to two systems — the fold to Postgres, the
 offset to Kafka — and nothing covers both. The order between them is deliberate and
 switchable (003 D4), and the window between them can be opened on purpose (003 D5).
+
+From 006 the loop reads **two** topics, and only one of them folds. ``order-lifecycle``
+is the event log and remains the fold's sole source. ``order-snapshot`` is compacted and
+is read for one thing: a message with a null value is a tombstone, and it deletes that
+order's fold (006 D7). Its non-null messages are committed and otherwise ignored — the
+merge of log and table is 007's job, not this loop's.
 """
 
 import json
@@ -339,9 +345,14 @@ class ServiceConsumer:
             KafkaException: If the broker reports a fatal error.
         """
         topic = self._settings.order_lifecycle_topic
+        # 006 R6.10 — two topics now: the event log that feeds the fold, and the compacted
+        # table whose tombstones empty it. One subscription rather than a fourth service,
+        # because the state being deleted belongs to THIS group and a separate reader would
+        # have to delete other groups' rows, undoing R3.2's independence (006 D7).
+        snapshot_topic = self._settings.order_snapshot_topic
         # D5 — the callbacks only log and manage folds; the client assigns (R2.16).
         self._consumer.subscribe(
-            [topic],
+            [topic, snapshot_topic],
             on_assign=self._on_assign,
             on_revoke=self._on_revoke,
             on_lost=self._on_lost,
@@ -349,10 +360,11 @@ class ServiceConsumer:
         self._running = True
         # R2.22 — protocol and assignor in the banner, so logs are self-describing.
         logger.info(
-            "[%s/%s] consuming topic=%s group=%s brokers=%s handling=%s",
+            "[%s/%s] consuming topic=%s snapshot_topic=%s group=%s brokers=%s handling=%s",
             self._spec.name,
             self._instance,
             topic,
+            snapshot_topic,
             self._group_id,
             self._settings.kafka_bootstrap_servers,
             ",".join(sorted(str(t) for t in self._spec.handlers)) or "<nothing>",
@@ -492,6 +504,30 @@ class ServiceConsumer:
         """
         key = message.key()
         partition = message.partition()
+
+        # 006 R6.10, D5 — FIRST, before _decode. A null value is what a tombstone is, and
+        # _decode calls raw.decode() on it: that raises AttributeError, which _decode
+        # re-raises as NonRetryableError, which 005 routes to the dead-letter topic. Every
+        # delete would become a dead letter. 005's routing is untouched here, only bypassed.
+        if message.value() is None:
+            self._handle_tombstone(message, partition)
+            return
+
+        # R6.12 — the snapshot topic is read for its tombstones and nothing else. Folding
+        # a snapshot as though it were an event would give the fold two writers disagreeing
+        # about last_sequence, which is precisely the merge 007 exists to do properly.
+        if message.topic() == self._settings.order_snapshot_topic:
+            logger.debug(
+                "[%s/%s] snapshot partition=%d offset=%d key=%s (not folded)",
+                self._spec.name,
+                self._instance,
+                partition,
+                message.offset(),
+                key_of(message),
+            )
+            self._commit(message)
+            return
+
         try:
             event = self._decode(message)
         except NonRetryableError as exc:
@@ -549,6 +585,39 @@ class ServiceConsumer:
             time.sleep(self._settings.handler_delay_seconds)
 
         self._persist_and_commit(message, event, updated, partition)
+
+    def _handle_tombstone(self, message: Message, partition: int) -> None:
+        """Erase one order's fold because a tombstone said to, then commit (R6.10, R6.13).
+
+        The order is gone from the compacted topic; this makes it gone from this group's
+        memory too. Note what it does **not** reach: Kafka has no cross-topic delete, so
+        the order's events are still in ``order-lifecycle``, its pending messages still in
+        the retry topic, and its dead letters still in the DLQ. A replay from earliest, a
+        waking retry worker, or ``dlq_replay.py`` will each recreate this fold. One root
+        cause — the fold has two sources with independent retention — and 007 removes the
+        second source (006 D11).
+
+        Raises:
+            StateStoreUnavailable: If the delete fails. Deliberately not caught, so a dead
+                database stops the loop rather than silently skipping deletes (R3.22).
+        """
+        order_id = key_of(message)
+        deleted = self._store.delete(partition, order_id)
+        # R6.11 — WARNING and a stable marker, alongside VIOLATION and the DLQ markers,
+        # so `grep TOMBSTONE` suffices. Logged even when nothing was deleted: on a replay
+        # that is the normal case and the absence of a line would read as a lost message.
+        logger.warning(
+            "[%s/%s] TOMBSTONE order_id=%s deleted=%s topic=%s partition=%d offset=%d",
+            self._spec.name,
+            self._instance,
+            order_id,
+            deleted,
+            message.topic(),
+            partition,
+            message.offset(),
+        )
+        # R6.13 — a delete must not stall the partition it arrived on.
+        self._commit(message)
 
     def _route_failure(
         self, message: Message, exc: BaseException, *, event: LifecycleEvent | None

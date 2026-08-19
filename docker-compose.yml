@@ -59,6 +59,16 @@ x-kafka-env: &kafka-env
   KAFKA_DEFAULT_REPLICATION_FACTOR: 3
   KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
 
+  # --- spec 006: the log cleaner, stated rather than assumed ---
+  # Both of these are already the broker's defaults. They are written down because from
+  # 006 there is a topic whose correctness depends on the cleaner actually running, and a
+  # setting that matters should be visible in the environment rather than inherited
+  # silently. The cleaner is the ONLY component that reads a null value as "erase this
+  # key" — which is why a tombstone means nothing on a cleanup.policy=delete topic.
+  # Per-topic tuning lives in scripts/create_topics.sh, not here (006 D9).
+  KAFKA_LOG_CLEANER_ENABLE: "true"
+  KAFKA_LOG_CLEANER_BACKOFF_MS: 5000
+
   # --- Learning-friendly tweaks ---
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # force explicit topic creation
   KAFKA_NUM_PARTITIONS: 3
@@ -76,6 +86,19 @@ x-consumer-image: &consumer-image
   build: .
   image: kafka-playground:local
 
+# --- spec 006: both topics, written once ----------------------------------------
+# ORDER_LIFECYCLE_TOPIC was repeated in five environment blocks; adding a second topic
+# to each was the fourth copy too many. Every producer and consumer must resolve the
+# SAME pair — a consumer pointed at a different snapshot topic than the producer writes
+# to would simply never see a delete, and nothing would report it.
+#
+# order-lifecycle is the event log (cleanup.policy=delete); order-snapshot is the table
+# (cleanup.policy=compact) and is where tombstones go. scripts/create_topics.sh creates
+# both and is the only place their config lives.
+x-topics-env: &topics-env
+  ORDER_LIFECYCLE_TOPIC: ${ORDER_LIFECYCLE_TOPIC:-order-lifecycle}
+  ORDER_SNAPSHOT_TOPIC: ${ORDER_SNAPSHOT_TOPIC:-order-snapshot}
+
 x-notification-consumer: &notification-consumer
   <<: *consumer-image
   command: python -m order_service.consumer.main
@@ -91,7 +114,6 @@ x-notification-consumer: &notification-consumer
 
 x-notification-env: &notification-env
   KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
-  ORDER_LIFECYCLE_TOPIC: order-lifecycle
   SERVICE_NAME: notification
   # One group id across all three — this is the whole feature.
   CONSUMER_GROUP_ID: notification-service
@@ -273,8 +295,8 @@ services:
     ports:
       - "8010:8010"
     environment:
+      <<: *topics-env
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
-      ORDER_LIFECYCLE_TOPIC: order-lifecycle
       ORDER_SERVICE_HOST: 0.0.0.0
       ORDER_SERVICE_PORT: 8010
     depends_on:
@@ -291,10 +313,9 @@ services:
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
-      ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
-      <<: [*state-db-env, *failure-env]
+      <<: [*topics-env, *state-db-env, *failure-env]
     depends_on: *consumer-deps
 
   # --- spec 002: notification scales out ----------------------------------
@@ -314,7 +335,7 @@ services:
     <<: *notification-consumer
     container_name: notification-consumer-1
     environment:
-      <<: [*notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-1
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
 
@@ -323,7 +344,7 @@ services:
     container_name: notification-consumer-2
     profiles: ["scale-out"]
     environment:
-      <<: [*notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-2
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
 
@@ -332,7 +353,7 @@ services:
     container_name: notification-consumer-3
     profiles: ["scale-out"]
     environment:
-      <<: [*notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-3
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
@@ -342,10 +363,9 @@ services:
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
-      ORDER_LIFECYCLE_TOPIC: order-lifecycle
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
-      <<: [*state-db-env, *failure-env]
+      <<: [*topics-env, *state-db-env, *failure-env]
     depends_on: *consumer-deps
 
   # --- spec 005: the process that does the waiting ------------------------
@@ -365,9 +385,8 @@ services:
     command: python -m order_service.consumer.retry_worker
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
-      ORDER_LIFECYCLE_TOPIC: order-lifecycle
       CONSUMER_INSTANCE_ID: retry-worker
-      <<: [*state-db-env, *failure-env]
+      <<: [*topics-env, *state-db-env, *failure-env]
     depends_on: *consumer-deps
 
 volumes:

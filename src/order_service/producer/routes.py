@@ -11,12 +11,22 @@ The order of operations in :func:`publish_event` is load-bearing:
 3. is the transition legal?        → ``409``, unless ``force``
 4. publish, waiting for the broker → ``502`` / ``504``
 5. advance the recorded state
+
+:func:`delete_order` follows the same shape for the same reason (006 D4):
+
+1. does the order exist?           → ``404``, and nothing is published
+2. publish the tombstone, waiting  → ``502`` / ``504``, and the order is left intact
+3. forget the order                → ``204``
+
+Both publishing handlers also write the order's current snapshot to the compacted topic.
+That write is fire-and-forget and cannot fail the request: the event log is the source of
+truth and the snapshot is derived from it (006 D3, R6.5).
 """
 
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from order_service.events import (
@@ -35,6 +45,7 @@ from order_service.producer.kafka_producer import (
 )
 from order_service.producer.orders import (
     IllegalTransition,
+    Order,
     OrderStore,
     UnknownOrder,
     new_order_id,
@@ -138,6 +149,16 @@ def _publish(producer: LifecycleEventProducer, event: LifecycleEvent) -> tuple[i
     return result.partition, result.offset
 
 
+def _publish_snapshot(request: Request, order: Order) -> None:
+    """Mirror an order's current state onto the compacted topic (R6.4).
+
+    Deliberately returns nothing and raises nothing. A lost snapshot is repaired by the
+    next event for that order; a lost lifecycle event is not repairable at all, so the
+    derived write must never be able to fail the authoritative one (006 D3).
+    """
+    _producer(request).publish_snapshot(order.order_id, order.as_snapshot())
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     """Report that the order service is up."""
@@ -182,6 +203,7 @@ def create_order(body: CreateOrderRequest, request: Request) -> CreateOrderRespo
     )
     partition, offset = _publish(_producer(request), event)
     order = _orders(request).register(order_id, payload)
+    _publish_snapshot(request, order)
 
     logger.info(
         "order created order_id=%s total=%d items=%d partition=%d offset=%d",
@@ -252,6 +274,7 @@ def publish_event(
     )
     partition, offset = _publish(_producer(request), event)
     order = store.commit(order_id, body.event_type, force=body.force)
+    _publish_snapshot(request, order)
 
     if body.force:
         logger.warning(
@@ -278,6 +301,64 @@ def publish_event(
         offset=offset,
         forced=body.force,
     )
+
+
+@router.delete("/orders/{order_id}", status_code=204)
+def delete_order(order_id: str, request: Request) -> Response:
+    """Delete one order by publishing a tombstone for it (R6.6, R6.8).
+
+    The tombstone — the order's key with a null value on the compacted topic — is what
+    erases the order from the table and tells every consumer group to drop its fold. It
+    is published *before* the order leaves this service's store, and the order is kept if
+    the broker does not acknowledge (R6.9): a delete that is half-applied, gone locally
+    but alive in three consumers' folds, has nothing left to re-drive it from.
+
+    What this does **not** reach: the order's events stay in ``order-lifecycle``, its
+    pending messages in the retry topic, its dead letters in the DLQ. Kafka has no
+    cross-topic delete. See 006 D11 for the three paths that can therefore resurrect it.
+
+    Args:
+        order_id: The order to delete; also the tombstone's key.
+        request: The incoming request, carrying application state.
+
+    Returns:
+        An empty ``204`` response.
+
+    Raises:
+        HTTPException: ``404`` if the order is unknown, ``502`` if the broker rejected
+            the tombstone, ``504`` if no delivery report arrived in time.
+    """
+    store = _orders(request)
+    # R6.7 — checked before anything is published, so an unknown id costs no message.
+    if store.get(order_id) is None:
+        raise HTTPException(status_code=404, detail=f"no order {order_id}")
+
+    producer = _producer(request)
+    try:
+        result = producer.publish_tombstone(order_id)
+    except DeliveryTimeout as exc:
+        logger.error("tombstone delivery timeout for %s: %s", order_id, exc)
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except DeliveryFailed as exc:
+        logger.error("tombstone delivery failed for %s: %s", order_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        order = store.remove(order_id)
+    except UnknownOrder as exc:
+        # Raced with another delete. The tombstone is already on the topic and is
+        # idempotent, so this is a success, not a 404.
+        logger.info("order %s was already removed: %s", order_id, exc)
+        return Response(status_code=204)
+
+    logger.warning(
+        "TOMBSTONE published order_id=%s state=%s partition=%d offset=%d",
+        order_id,
+        order.state,
+        result.partition,
+        result.offset,
+    )
+    return Response(status_code=204)
 
 
 @router.get("/orders/{order_id}")

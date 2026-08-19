@@ -158,6 +158,11 @@ Compaction keeps only the newest value per key. It runs on *closed* segments, so
 you must produce enough to roll a segment (hence the tiny `segment.ms`) before
 old values disappear. A key with a `null` value is a tombstone — it deletes the key.
 
+This is the mechanism [spec 006](#spec-006--compaction-and-tombstones) builds on, where
+`order-snapshot` is a real compacted topic and `DELETE /orders/{id}` writes a real
+tombstone. See [docs/compaction-and-tombstones.md](docs/compaction-and-tombstones.md) for
+why the *event* topic must not be compacted.
+
 ## Other tools
 
 ```bash
@@ -210,7 +215,7 @@ Three things it demonstrates:
 
 ```bash
 docker compose up -d --build            # broker, UI, order service, 3 consumers
-./scripts/create_topics.sh              # creates order-lifecycle (auto-create is off)
+./scripts/create_topics.sh              # creates every topic (auto-create is off)
 docker compose logs -f inventory-consumer notification-consumer analytics-consumer
 ```
 
@@ -228,6 +233,7 @@ SERVICE_NAME=analytics    .venv/bin/python -m order_service.consumer.main
 | `POST /orders` | create a prepaid order; `422` if the payment ≠ the item sum |
 | `POST /orders/{order_id}/events` | advance it; `409` if the transition is illegal |
 | `GET /orders/{order_id}` | the service's own record of the order |
+| `DELETE /orders/{order_id}` | delete it by publishing a tombstone ([spec 006](#spec-006--compaction-and-tombstones)) |
 
 Advancing one order through the chain, with `ORDER` holding the id `POST /orders`
 returned. Watch the three consumer logs between each call — every one of them sees
@@ -518,3 +524,67 @@ Four things it demonstrates:
 | Nothing alerts on dead-letter depth | out of scope — a dead-letter topic nobody watches is a silent loss bucket |
 | Producer retries can reorder without `enable.idempotence` | 008 |
 | One worker means one service's backoff holds up the others' | accepted; the fix is a worker per service |
+
+---
+
+# Spec 006 — Compaction and Tombstones
+
+Nothing here could delete an order. Fixing that needs the one Kafka mechanism the ladder
+had not met: a topic that behaves as a **table** rather than a log.
+
+`cleanup.policy=compact` retains the latest value per key indefinitely and garbage-collects
+the rest, so replaying rebuilds current state at a cost proportional to the number of
+**keys** rather than the number of **events**. A `null` value under a key — a **tombstone** —
+erases the key, and then, after `delete.retention.ms`, erases itself.
+
+**It cannot go on `order-lifecycle`, and that is the lesson.** An order is four messages
+under one key, each an *increment*: `PACKED` does not carry the items, `SHIPPED` does not
+carry the payment. Compaction would keep only the newest and leave a `DELIVERED` event with
+no creation behind it — a permanent `SEQUENCE_GAP` and an unreconstructable order.
+Compaction is safe only where a message **replaces** its predecessor, never where it **adds**
+to it. So 006 adds a second, compacted topic and leaves the event log alone.
+
+Read [docs/compaction-and-tombstones.md](docs/compaction-and-tombstones.md). Full spec in
+[specs/006-compaction-tombstones/](specs/006-compaction-tombstones/requirements.md).
+
+```bash
+docker compose up -d --build              # no `down -v` this time
+./scripts/create_topics.sh                # adds order-snapshot, the compacted one
+
+ORDER=$(./scripts/place_orders.sh 1 | grep -oE 'ord-[a-z0-9-]+' | head -1)
+for E in PACKED SHIPPED DELIVERED; do
+  curl -sX POST localhost:8010/orders/$ORDER/events \
+    -H 'content-type: application/json' -d "{\"event_type\":\"$E\"}" >/dev/null
+done
+
+# the table: several values per key, until the cleaner runs
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:19092 --topic order-snapshot --from-beginning \
+  --property print.key=true --timeout-ms 5000
+
+# delete it — 204, and a null value appears under the key
+curl -i -X DELETE localhost:8010/orders/$ORDER
+docker compose logs --since 1m | grep TOMBSTONE
+
+# and the fold is gone from all three groups
+docker exec -it postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT group_id, order_id FROM order_fold WHERE order_id = '$ORDER';"
+```
+
+| Lever | What it causes |
+|---|---|
+| `SNAPSHOT_SEGMENT_MS` | how soon a segment closes — the cleaner never touches the active one |
+| `SNAPSHOT_MIN_CLEANABLE_DIRTY_RATIO` | how much garbage before cleaning is worth it (Kafka's default 0.5 makes it invisible) |
+| `SNAPSHOT_DELETE_RETENTION_MS` | how long a tombstone lingers before erasing itself |
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| A replay from earliest resurrects a deleted order | 007 — one source for state, one retention policy |
+| A pending retry recreates a deleted fold | 007, same root cause |
+| `dlq_replay.py` can republish a deleted order | 007, same root cause |
+| The fold is derived from two topics with independent retention | 007 |
+| No `ORDER_DELETED` event on the log — the delete lives only in the table | out of scope; needs a new `EventType` and a terminal `OrderState` |
+| A lost snapshot write is repaired only by the next event, and `DELIVERED` has none | accepted; the event log is the source of truth |
+| The snapshot topic's cleaner settings are unrealistic | accepted; production values in the doc |
