@@ -192,6 +192,14 @@ Simulating a *decode* failure this way would be dishonest, so `scripts/produce_p
 raw non-JSON bytes with `kafka-console-producer`. That exercises D2's decode branch with a real
 malformed message rather than a handler pretending to be one.
 
+The three variables are passed through `x-failure-env` from the host, defaulting to `none`, the way
+002 passes `CONSUMER_ASSIGNMENT_STRATEGY`. As first built they were named only in a comment and
+reached no container at all, which made the lever unreachable in the assembled system. Sharing the
+anchor does not bake the lever in: `up -d --force-recreate <service>` recreates only what it names.
+**The consumer and the retry worker must be recreated together** — attempt 1 is the consumer's and
+the rest are the worker's, so a lever on one of them either never fails or never keeps failing, and
+the attempt budget R5.9 sets cannot be observed end to end.
+
 ### D12 — `min.insync.replicas` is altered onto the topic, not only passed at creation — *R5.20, R5.21, R5.22*
 
 `create_topics.sh` passes `--config min.insync.replicas=$MIN_INSYNC_REPLICAS` on create **and**

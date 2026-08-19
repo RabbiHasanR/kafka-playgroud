@@ -468,8 +468,9 @@ docker compose up -d --build              # no `down -v` this time
 
 # a message that fails twice and then works
 ORDER=$(./scripts/place_orders.sh 1 | grep -oE 'ord-[a-z0-9-]+' | head -1)
+# both containers: the consumer spends attempt 1, the worker spends the rest
 HANDLER_FAILURE_MODE=transient HANDLER_FAILURE_ORDERS=$ORDER \
-  docker compose up -d --force-recreate inventory-consumer
+  docker compose up -d --force-recreate inventory-consumer retry-worker
 docker compose logs -f inventory-consumer retry-worker \
   | grep -E 'RETRY_SCHEDULED|RETRY_WAITING|RETRY_SUCCEEDED'
 

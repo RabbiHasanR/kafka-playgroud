@@ -111,12 +111,20 @@ x-notification-env: &notification-env
 # which is the whole of what makes it terminal (005 D10). If you ever find yourself
 # adding a service that subscribes to DLQ_TOPIC, that is the feature being undone.
 #
-# The failure lever (HANDLER_FAILURE_*) is deliberately NOT here. Like 002's
-# HANDLER_DELAY_SECONDS and 003's STATE_CRASH_AFTER it is set per-experiment on one
-# instance, not baked into the assembled system.
+# The failure lever is passed through from the host with an inert default, the way 002
+# does it for CONSUMER_ASSIGNMENT_STRATEGY. It is still per-experiment rather than baked
+# in: `up -d --force-recreate inventory-consumer retry-worker` recreates only those two,
+# so every other consumer keeps running without it.
+#
+# Both names are needed together for a `transient` run. The main consumer spends attempt
+# 1 and the worker spends the rest, so a lever set on only one of them either never fails
+# or never keeps failing, and the attempt budget cannot be observed end to end.
 x-failure-env: &failure-env
   RETRY_TOPIC: ${RETRY_TOPIC:-order-lifecycle.retry}
   DLQ_TOPIC: ${DLQ_TOPIC:-order-lifecycle.dlq}
+  HANDLER_FAILURE_MODE: ${HANDLER_FAILURE_MODE:-none}
+  HANDLER_FAILURE_ORDERS: ${HANDLER_FAILURE_ORDERS:-}
+  HANDLER_FAILURE_ATTEMPTS: ${HANDLER_FAILURE_ATTEMPTS:-2}
 
 # --- spec 003: the durable state store, written once for all five consumers ------
 # STATE_BACKEND defaults to `memory` in config.py so a bare `python -m
