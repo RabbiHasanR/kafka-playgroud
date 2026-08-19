@@ -248,6 +248,7 @@ docker compose run --rm retry-worker python -m order_service.tools.dlq_replay
 
   poison-order-1    service=inventory  group=inventory-service  attempts=1  origin=order-lifecycle-1@94
       NonRetryableError: undecodable message: Expecting value: line 1 column 1 (char 0)
+      excluded — non-retryable; --include-poison to replay anyway
 
 # only what one service gave up on
 ... python -m order_service.tools.dlq_replay --service inventory
@@ -259,6 +260,41 @@ docker compose run --rm retry-worker python -m order_service.tools.dlq_replay
 The intended sequence is **read what failed → fix the cause → replay**. Replaying a message
 whose cause was not fixed sends it straight back to the dead-letter topic. That round trip is
 worth doing once deliberately; it is the demonstration of why auto-replay is wrong.
+
+### Two guards on the tool itself
+
+The paragraph above is the intent. The tool needs two guards to make the intent hold, and the
+first version of it had neither.
+
+**A run is bounded by a snapshot taken before it publishes anything.** Each dead-letter
+partition's high watermark is read up front, the partitions are assigned at their earliest
+offsets, and the run stops at the offsets it recorded. This is not a detail. Republishing to
+`order-lifecycle` provokes three fresh dead letters — one per consumer group — and they land
+about 150ms later. A tool that reads to the *live* end of the topic therefore reads its own
+consequences and republishes them, with no end:
+
+```
+replay reads 1  →  publishes to order-lifecycle  →  3 consumers fail  →  3 new dead letters
+        ↑                                                                        │
+        └──────────────── still polling; 5s idle never arrives ──────────────────┘
+```
+
+`--service inventory` does not save you — it makes the loop *steadier*. One replay produces
+one dead letter per group, exactly one of which matches the filter, so the cycle sustains
+itself at 1:1 instead of blowing up 3× per round. Left alone for a few minutes this produced
+9,295 messages on `order-lifecycle` and 27,816 on the dead-letter topic, all on partition 1,
+because every one of them carried the same key.
+
+**Non-retryable dead letters are not republished by default.** Non-retryable is *defined* as
+"the same bytes fail the same way every time", so replaying one unchanged is guaranteed to
+refill the topic — the 1→3 amplification above with no chance of success. They are still
+listed and counted, since a tool that hides what is in the topic is worse than useless.
+`--include-poison` replays them anyway, which is how the round trip above is watched on
+purpose rather than by accident.
+
+Neither guard helps a transient failure whose cause has not been fixed. Nothing in the tool
+can know whether it has been — that judgement is yours, and is the reason `--publish` is a
+flag rather than a default.
 
 ### Replay reaches every consumer group
 

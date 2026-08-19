@@ -139,3 +139,19 @@ hand. It is cited at T11 because that is where the choice is made visible, per D
   statement that tiered delay topics, dead-letter depth alerting, dead-letter retention and
   unclean leader election remain open, naming where each is closed.
   — *R5.24* — D2, D6, D10, D14
+
+## Bounding replay
+
+- [x] **T15** — Replace `dlq_replay.py`'s `subscribe()` and idle-timeout loop with a bounded
+  read: resolve the dead-letter topic's partitions via `list_topics`, capture each one's high
+  watermark with `get_watermark_offsets(cached=False)` *before* publishing anything, `assign()`
+  them at their beginning offsets, and stop once every partition has yielded its recorded
+  watermark minus one. Treat an empty partition as complete before the loop starts, and keep the
+  idle timeout only as a stall guard. Correct the module docstring, which claims the tool refuses
+  to automate the replay loop — until this task it did not.
+  — *R5.17* — D10
+- [x] **T16** — Skip republishing a dead letter whose `x-error-class` is non-retryable unless
+  `--include-poison` is passed, listing it with an `excluded — non-retryable` note and tallying
+  the exclusions separately from the republished count. The exclusion applies to publication
+  only; the listing is unchanged.
+  — *R5.25* — D10

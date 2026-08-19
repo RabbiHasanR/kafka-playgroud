@@ -166,7 +166,7 @@ reuses its last entry rather than failing.
 `VIOLATION` / `COMMIT_REJECTED` / `DUPLICATE_ABSORBED` convention already in `runtime.py`: a
 stable uppercase token first, then `key=value` fields, so one `grep` answers the question.
 
-### D10 — The dead-letter topic is terminal; replay is a separate tool that reports by default — *R5.15, R5.17, R5.18*
+### D10 — The dead-letter topic is terminal; replay is a separate tool that reports by default — *R5.15, R5.17, R5.18, R5.25*
 
 Nothing in `docker-compose.yml` consumes the dead-letter topic. `order_service/tools/dlq_replay.py`
 is run by hand, reads with `enable.auto.commit=False` and commits nothing, prints what it would
@@ -179,6 +179,32 @@ The topic's value is that it is terminal and someone has to look, so the default
 Republishing goes to `x-original-topic`, which means **all three groups** re-consume it. The two
 that already succeeded absorb it through 003's sequence guard and log `DUPLICATE_ABSORBED` — the
 at-least-once cost 003 recorded, arriving from a new direction, and driven to zero at 008.
+
+**The run is bounded by a snapshot taken before the first publish.** The tool captures each
+dead-letter partition's high watermark up front, assigns itself those partitions at their
+beginning offsets, and stops when every partition reaches the watermark it recorded. It does not
+`subscribe()`, and it does not stop on an idle poll.
+
+That bound is what makes the tool terminate at all, and the first version did not have it.
+Replaying to `order-lifecycle` provokes failures that land back in the dead-letter topic within
+roughly 150ms, so a tool that reads to the *live* end of the topic reads its own consequences and
+republishes them, forever. Restricting to one service does not help: one replay produces one
+dead letter per consumer group, of which one matches the filter, and the cycle sustains itself at
+1:1. Unrestricted it is 3× per round. Messages the run causes land at offsets at or beyond the
+recorded watermark and are therefore out of scope for that run, by construction — the next run
+will see them, which is correct, because by then a human has chosen to look again.
+
+Assignment rather than subscription also makes "commits nothing" structural: with no group
+membership there is no coordinator to commit to. `group.id` survives only because the client
+requires one to build a `Consumer`.
+
+**Non-retryable dead letters are excluded from republication by default (R5.25).** Non-retryable
+means the same bytes deterministically produce the same failure, so replaying them unchanged is
+guaranteed to refill the topic — the 1→3 amplification above with no possibility of success.
+They are still listed, marked as excluded and tallied separately, because hiding them would
+defeat the point of a tool whose job is to show what is in there. `--include-poison` restores the
+old behaviour for the one case that wants it: watching a poison message make the round trip.
+Bounding the run (above) is what stops runaway; this is what stops the pointless case.
 
 ### D11 — The failure lever is environment-driven, plus one genuinely malformed message — *R5.19*
 

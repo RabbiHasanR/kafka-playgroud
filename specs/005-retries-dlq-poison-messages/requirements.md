@@ -149,6 +149,9 @@ open.
   explicitly.
 - **R5.18** — THE SYSTEM SHALL allow that tool to be restricted to the messages one named
   service gave up on.
+- **R5.25** — WHERE a dead letter's recorded error class is non-retryable THE SYSTEM SHALL
+  exclude it from republication unless inclusion is requested explicitly, and SHALL report it
+  as excluded rather than omitting it from the listing.
 
 ### Making it fail
 
