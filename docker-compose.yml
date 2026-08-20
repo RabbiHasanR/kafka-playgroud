@@ -60,12 +60,21 @@ x-kafka-env: &kafka-env
   KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
 
   # --- spec 006: the log cleaner, stated rather than assumed ---
-  # Both of these are already the broker's defaults. They are written down because from
-  # 006 there is a topic whose correctness depends on the cleaner actually running, and a
-  # setting that matters should be visible in the environment rather than inherited
-  # silently. The cleaner is the ONLY component that reads a null value as "erase this
-  # key" — which is why a tombstone means nothing on a cleanup.policy=delete topic.
-  # Per-topic tuning lives in scripts/create_topics.sh, not here (006 D9).
+  # These configure the cleaner THREAD — the worker. They do NOT make any topic
+  # compacted: `cleanup.policy=compact` is a TOPIC setting and is the only thing that
+  # opts a topic in (scripts/create_topics.sh, 006 D9). Set these alone and nothing is
+  # ever compacted anywhere.
+  #
+  # The cleaner matters from 006 because it is the ONLY component that reads a null
+  # value as "erase this key" — which is why a tombstone means nothing on a
+  # cleanup.policy=delete topic, and why this is written down rather than inherited.
+  #
+  # enable=true is already the broker default, restated for visibility.
+  # backoff=5s is NOT: the default is 15s. It is how long the cleaner sleeps when it
+  # finds nothing worth cleaning, so it bounds how late compaction can be once a
+  # segment does roll. Lowered to keep the walkthrough's waits honest at the 10s
+  # segment.ms the snapshot topic uses; at the 7d default segment roll it would be
+  # noise either way.
   KAFKA_LOG_CLEANER_ENABLE: "true"
   KAFKA_LOG_CLEANER_BACKOFF_MS: 5000
 
