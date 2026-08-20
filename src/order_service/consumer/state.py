@@ -488,20 +488,26 @@ class LocalStateStore:
         """Replay one changelog partition into one store, and log what it cost."""
         started = time.monotonic()
         reader = self._changelog_reader()
-        target = TopicPartition(self._topic, partition)
         try:
-            _low, high = reader.get_watermark_offsets(
-                target, timeout=_WATERMARK_TIMEOUT_SECONDS, cached=False
-            )
-        except KafkaException as exc:
-            reader.close()
-            raise StateStoreUnavailable(
-                f"cannot read the end of {self._topic}-{partition}: {exc}"
-            ) from exc
+            self._await_metadata(reader, partition)
+            target = TopicPartition(self._topic, partition)
+            try:
+                _low, high = reader.get_watermark_offsets(
+                    target, timeout=_WATERMARK_TIMEOUT_SECONDS, cached=False
+                )
+            except KafkaException as exc:
+                raise StateStoreUnavailable(
+                    f"cannot read the end of {self._topic}-{partition}: {exc}"
+                ) from exc
 
-        start = self._start_offset(partition, low=_low)
-        records, keys = 0, 0
-        try:
+            start = self._start_offset(partition, low=_low)
+            # Opened whether or not there is anything to replay. An owned partition has a
+            # store, and the lock on it, from the moment it is assigned — otherwise an
+            # empty changelog leaves the member owning partitions it holds no store for,
+            # and `held()` reports [] while the rebalance log says otherwise (R7.3).
+            self._store_for(partition)
+
+            records, keys = 0, 0
             if start < high:
                 # assign(), never subscribe(): a subscription would join a SECOND group
                 # and rebalance it — during a rebalance (007 D7).
@@ -593,6 +599,46 @@ class LocalStateStore:
                 return max(checkpoint, low)
         self._destroy(partition)
         return low
+
+    def _await_metadata(self, reader: Consumer, partition: int) -> None:
+        """Load the changelog's metadata before anything asks about its offsets.
+
+        ``get_watermark_offsets`` answers from librdkafka's **local** metadata cache, so a
+        consumer that has not fetched metadata yet fails it with ``_UNKNOWN_PARTITION``
+        (a local error, value -190) rather than asking the broker. That happens routinely
+        on a cold start, when the consumers reach their first rebalance before the broker
+        is serving topic metadata — and without this call it kills the process over a race
+        that resolves itself a second later.
+
+        ``list_topics`` is a real metadata request, so it both settles the race and turns
+        a genuinely missing topic into an error that says which one and what to run.
+
+        Raises:
+            StateStoreUnavailable: If metadata cannot be fetched, or the topic really does
+                not have this partition.
+        """
+        try:
+            metadata = reader.list_topics(
+                topic=self._topic, timeout=_WATERMARK_TIMEOUT_SECONDS
+            )
+        except KafkaException as exc:
+            raise StateStoreUnavailable(
+                f"cannot fetch metadata for {self._topic}: {exc}"
+            ) from exc
+
+        topic_metadata = metadata.topics.get(self._topic)
+        if topic_metadata is None or topic_metadata.error is not None:
+            reason = "unknown" if topic_metadata is None else topic_metadata.error
+            raise StateStoreUnavailable(
+                f"changelog topic {self._topic} is not available ({reason}) — "
+                f"auto-creation is off, so run scripts/create_topics.sh"
+            )
+        if partition not in topic_metadata.partitions:
+            raise StateStoreUnavailable(
+                f"{self._topic} has no partition {partition} "
+                f"(it has {sorted(topic_metadata.partitions)}) — the changelog must have "
+                f"the same partition count as the lifecycle topic"
+            )
 
     def _changelog_reader(self) -> Consumer:
         """Build the assign-only consumer a rebuild reads through (R7.8).
