@@ -10,10 +10,18 @@
 #   order-lifecycle        spec 001 — the prepaid order service and its three consumers
 #   order-lifecycle.retry  spec 005 — where a retryable failure waits out its backoff
 #   order-lifecycle.dlq    spec 005 — where a message nothing could process ends up
-#   order-snapshot         spec 006 — the COMPACTED one: current state per order, plus
-#                                     tombstones. The only topic here that is a table
-#                                     rather than a log, which is why it is the only one
-#                                     carrying extra config (006 D1).
+#   order-snapshot         spec 006 — COMPACTED: current state per order, plus tombstones.
+#                                     A table rather than a log (006 D1).
+#   order-fold.<group>     spec 007 — COMPACTED: one changelog per CONSUMER GROUP, carrying
+#                                     that group's folded state per order. Three of them,
+#                                     one each for inventory/notification/analytics.
+#
+# Why the changelog is per group and not one topic keyed by order (007 D1): compaction
+# retains the latest value per KEY, and the three groups fold the same order at their own
+# pace — inventory can still be at PACKED while notification is at SHIPPED. One topic keyed
+# by order_id would have them overwrite each other. Putting the group in the key instead
+# would put it in the partition hash, so an order's fold and its events would land on
+# different partition numbers and 007's single-partition rebuild would be impossible.
 #
 # Usage note: REPLICATION_FACTOR is read from the environment and defaults to 3, the
 # broker count as of spec 004. MIN_INSYNC_REPLICAS defaults to 2 and closes 004's open
@@ -25,11 +33,28 @@ set -euo pipefail
 
 # Feature topics, overridable individually so a host run can point at a scratch topic.
 SNAPSHOT_TOPIC="${ORDER_SNAPSHOT_TOPIC:-order-snapshot}"
+
+# spec 007 — the changelog topics, named `<prefix>.<group_id>`. The group ids are the
+# defaults config.py's `group_id_for()` produces; override CONSUMER_GROUP_ID for a service
+# and its changelog must be created by hand, which auto-creation being off makes loud
+# rather than silent.
+CHANGELOG_PREFIX="${STATE_CHANGELOG_PREFIX:-order-fold}"
+CONSUMER_GROUPS=(
+  "${INVENTORY_GROUP_ID:-inventory-service}"
+  "${NOTIFICATION_GROUP_ID:-notification-service}"
+  "${ANALYTICS_GROUP_ID:-analytics-service}"
+)
+FOLD_TOPICS=()
+for GROUP in "${CONSUMER_GROUPS[@]}"; do
+  FOLD_TOPICS+=("$CHANGELOG_PREFIX.$GROUP")
+done
+
 TOPICS=(
   "${ORDER_LIFECYCLE_TOPIC:-order-lifecycle}"
   "${RETRY_TOPIC:-order-lifecycle.retry}"
   "${DLQ_TOPIC:-order-lifecycle.dlq}"
   "$SNAPSHOT_TOPIC"
+  "${FOLD_TOPICS[@]}"
 )
 # ONE partition count for every topic, and that is load-bearing rather than tidy (006 D8).
 # The consumers cache folds by partition NUMBER, so order-snapshot-2 and order-lifecycle-2
@@ -70,15 +95,34 @@ SNAPSHOT_MIN_CLEANABLE_DIRTY_RATIO="${SNAPSHOT_MIN_CLEANABLE_DIRTY_RATIO:-0.01}"
 SNAPSHOT_DELETE_RETENTION_MS="${SNAPSHOT_DELETE_RETENTION_MS:-60000}"
 SNAPSHOT_MIN_COMPACTION_LAG_MS="${SNAPSHOT_MIN_COMPACTION_LAG_MS:-0}"
 
-# Per-topic extra config, newline-separated `key=value`. Only the snapshot topic has any;
-# a newline delimiter rather than a comma because Kafka config VALUES can contain commas
-# (`cleanup.policy=compact,delete` is one setting, not two).
+# -- spec 007: the changelog topics' cleaner knobs -----------------------------------
+# Separate variables from the SNAPSHOT_* ones above rather than shared with them, because
+# the two tombstone windows protect different things (007 design, environment surface):
+# the snapshot's is how long a lagging consumer can still LEARN of a delete, the
+# changelog's is how long a rebuilding store is still told not to RESTORE one. Same
+# observation-tuned defaults, tunable apart.
+FOLD_SEGMENT_MS="${FOLD_SEGMENT_MS:-10000}"
+FOLD_MIN_CLEANABLE_DIRTY_RATIO="${FOLD_MIN_CLEANABLE_DIRTY_RATIO:-0.01}"
+FOLD_DELETE_RETENTION_MS="${FOLD_DELETE_RETENTION_MS:-60000}"
+FOLD_MIN_COMPACTION_LAG_MS="${FOLD_MIN_COMPACTION_LAG_MS:-0}"
+
+# Per-topic extra config, newline-separated `key=value`. Only the compacted topics have
+# any; a newline delimiter rather than a comma because Kafka config VALUES can contain
+# commas (`cleanup.policy=compact,delete` is one setting, not two).
 declare -A EXTRA_CONFIG=()
 EXTRA_CONFIG["$SNAPSHOT_TOPIC"]="cleanup.policy=compact
 segment.ms=$SNAPSHOT_SEGMENT_MS
 min.cleanable.dirty.ratio=$SNAPSHOT_MIN_CLEANABLE_DIRTY_RATIO
 delete.retention.ms=$SNAPSHOT_DELETE_RETENTION_MS
 min.compaction.lag.ms=$SNAPSHOT_MIN_COMPACTION_LAG_MS"
+
+for FOLD_TOPIC in "${FOLD_TOPICS[@]}"; do
+  EXTRA_CONFIG["$FOLD_TOPIC"]="cleanup.policy=compact
+segment.ms=$FOLD_SEGMENT_MS
+min.cleanable.dirty.ratio=$FOLD_MIN_CLEANABLE_DIRTY_RATIO
+delete.retention.ms=$FOLD_DELETE_RETENTION_MS
+min.compaction.lag.ms=$FOLD_MIN_COMPACTION_LAG_MS"
+done
 
 CONTAINER="${KAFKA_CONTAINER:-kafka}"
 # INTERNAL, not localhost:9092. This script always runs via `docker exec`, and inside a

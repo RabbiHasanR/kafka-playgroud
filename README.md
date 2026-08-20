@@ -319,7 +319,7 @@ Four things it demonstrates:
 
 | Gap | Closed by |
 |---|---|
-| A moved partition loses its fold → false `SEQUENCE_GAP` | 003, fully by 007 |
+| A moved partition loses its fold → false `SEQUENCE_GAP` | 003, **fully closed by 007** |
 | Rebalance duration and consumer lag are never measured | needs a load generator, excluded here |
 | Partition growth and key rehashing | a topic-level lesson, not a consumer-group one |
 | Single broker, RF 1 | **closed by 004** |
@@ -334,18 +334,19 @@ remembers your position; nothing remembered your memory.** 003 moves the fold in
 Postgres, keyed by `(group_id, order_id)` — so it belongs to the *order*, not to whoever
 holds the partition — and the false alarm stops.
 
+> **Postgres was replaced at [007](#spec-007--local-state-stores-and-changelog-topics).**
+> It was always the knowingly-weaker option ([X4](DECISIONS.md)), chosen because a
+> database makes the dual-write problem impossible to miss. The reasoning below is what
+> this section is for; the backend it describes is now an embedded store per instance.
+
 Read [docs/durable-state.md](docs/durable-state.md) — it has the measured numbers.
 Full spec in [specs/003-durable-consumer-state/](specs/003-durable-consumer-state/requirements.md).
 
 ```bash
-cp .env.example .env                      # POSTGRES_USER / PASSWORD / DB — no defaults given
-docker compose up -d --build              # postgres included; schema applied on first boot
+cp .env.example .env                      # no credentials in it since 007
+docker compose up -d --build
 ./scripts/create_topics.sh                # required after `down -v`
 docker compose --profile scale-out up -d  # three notification members
-
-# the memory itself
-docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT group_id, order_id, last_sequence, state, handled_count FROM order_fold LIMIT 10;"
 ```
 
 The same rebalance that 002 recorded, now run twice one variable apart:
@@ -366,28 +367,22 @@ banner names which backend is in force, so no run is ambiguous.
 
 | Variable | Default | What it is for |
 |---|---|---|
-| `STATE_BACKEND` | `memory` | `memory` \| `postgres` |
-| `STATE_DB_DSN` | unset | required when the backend is `postgres` |
+| `STATE_BACKEND` | `memory` | `memory` \| `local` (was `postgres` until 007) |
 | `STATE_WRITE_ORDER` | `state_first` | `offset_first` loses data permanently, on purpose |
 | `STATE_CRASH_AFTER` | `none` | `state_write` \| `offset_commit` — opens the dual-write window |
 
-The offset commits to Kafka and the fold writes to Postgres, and **no operation covers
-both**. `STATE_CRASH_AFTER` makes that gap reachable: crash after the state write and the
-event is redelivered, absorbed by the sequence guard, and the handler runs twice —
+The offset commits to Kafka and the fold is written somewhere else, and **no operation
+covers both**. `STATE_CRASH_AFTER` makes that gap reachable: crash after the state write
+and the event is redelivered, absorbed by the sequence guard, and the handler runs twice —
 `handled_count` ends up above `last_sequence`, which is the residue 008 removes.
 
 ```bash
-# rows that were handled more often than they have events
-docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT * FROM order_fold WHERE handled_count > last_sequence;"
+# the same residue, still visible after 007 — now in the log rather than a table
+docker compose logs | grep DUPLICATE_ABSORBED
 ```
 
-## Schema
-
-One file, `scripts/state_schema.sql`, applied two ways: mounted into the container's
-`/docker-entrypoint-initdb.d/`, and by `./scripts/apply_state_schema.sh`. Both exist
-because **the mount runs only when the data volume is empty** — after the first `up`,
-editing the schema and running `up` again does nothing at all, silently.
+Both levers survived 007 unchanged. What changed is that *both* writes are now Kafka
+operations, which is exactly why 008 can cover them with one transaction and 003 could not.
 
 ## Known gaps, all deliberate
 
@@ -395,8 +390,8 @@ editing the schema and running `up` again does nothing at all, silently.
 |---|---|
 | Duplicate side effects after a crash between the two writes | 008 |
 | Offset and state cannot be written atomically | 008 |
-| Shared database, not state co-partitioned with the input | 007 |
-| Rebuild cost grows with history, not with key count | 007 |
+| Shared database, not state co-partitioned with the input | **closed by 007** |
+| Rebuild cost grows with history, not with key count | **closed by 007** |
 | The producer's own `OrderStore` is still in memory | transactional outbox; no spec claims it |
 
 
@@ -567,8 +562,7 @@ curl -i -X DELETE localhost:8010/orders/$ORDER
 docker compose logs --since 1m | grep TOMBSTONE
 
 # and the fold is gone from all three groups
-docker exec -it postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT group_id, order_id FROM order_fold WHERE order_id = '$ORDER';"
+docker compose logs --since 1m | grep "TOMBSTONE order_id=$ORDER"
 ```
 
 | Lever | What it causes |
@@ -581,10 +575,99 @@ docker exec -it postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 
 | Gap | Closed by |
 |---|---|
-| A replay from earliest resurrects a deleted order | 007 — one source for state, one retention policy |
-| A pending retry recreates a deleted fold | 007, same root cause |
-| `dlq_replay.py` can republish a deleted order | 007, same root cause |
-| The fold is derived from two topics with independent retention | 007 |
+| A restart or rebalance resurrects a deleted order | **closed by 007** — the changelog is the store's only source, and it carries the tombstone |
+| A **deliberate replay from earliest** resurrects a deleted order | still open — re-reading the log re-folds the events, and the changelog tombstone only protects for `delete.retention.ms`. Needs the `ORDER_DELETED` event below. |
+| A pending retry recreates a deleted fold | **closed by 007** — the retry is republished and folded through the same tombstoned store |
+| `dlq_replay.py` can republish a deleted order | still open — same root cause as the replay row |
+| The fold is derived from two topics with independent retention | **closed by 007** — the store's only source is its changelog |
 | No `ORDER_DELETED` event on the log — the delete lives only in the table | out of scope; needs a new `EventType` and a terminal `OrderState` |
 | A lost snapshot write is repaired only by the next event, and `DELIVERED` has none | accepted; the event log is the source of truth |
 | The snapshot topic's cleaner settings are unrealistic | accepted; production values in the doc |
+
+---
+
+# Spec 007 — Local State Stores and Changelog Topics
+
+003 put the fold in Postgres **knowing it was the wrong long-term answer** —
+[X4](DECISIONS.md) says so in writing and books itself as *superseded by X5 at 007*. A
+database made the dual-write problem impossible to miss, which was the point. It also left
+one shared table that five processes contend on, holding rows for orders the member reading
+them does not own the events for.
+
+007 moves the fold onto **each instance's own disk** — one embedded RocksDB store per
+partition it owns — and makes it recoverable with a **compacted changelog topic** per
+consumer group. Rebuilding a partition replays that topic's matching partition, at a cost
+proportional to the number of **keys** rather than the number of **events**. That is what
+006's compaction was built for, and it is the mechanism Kafka Streams runs on internally.
+
+**The changelog is per group, and that is forced rather than chosen.** The three services
+walk an order's stages at their own pace — inventory can sit at `PACKED` while notification
+is at `SHIPPED` — and compaction keeps the latest value **per key**. One topic keyed by
+`order_id` would have them overwrite each other. Putting the group in the *key* instead
+fixes compaction and breaks partitioning, because the key is what the partitioner hashes.
+So the group goes in the **topic name** ([X13](DECISIONS.md)).
+
+Read [docs/local-state-and-changelog.md](docs/local-state-and-changelog.md). Full spec in
+[specs/007-local-state-stores-changelog/](specs/007-local-state-stores-changelog/requirements.md).
+
+```bash
+docker compose up -d --build              # no `down -v`; the image gains rocksdict
+./scripts/create_topics.sh                # adds order-fold.<group> ×3, compacted
+docker compose --profile scale-out up -d
+
+./scripts/place_orders.sh 9
+
+# co-partitioned state, as directories: one per partition this instance OWNS
+docker compose exec notification-consumer-1 ls -R /var/lib/order-state
+
+# the changelog: one live value per order, plus tombstones
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:19092 --topic order-fold.notification-service \
+  --from-beginning --property print.key=true --timeout-ms 5000
+
+# the rebuild, and what it cost — `records` vs `keys` is the whole feature
+docker compose restart notification-consumer-1
+docker compose logs notification-consumer-1 | grep -E "REBALANCE|RESTORED"
+#   REBALANCE ASSIGNED partitions=[0] held=[]
+#   RESTORED partition=0 records=1180 keys=94 from=0 to=1180 mode=full ms=412
+```
+
+## Levers
+
+| Variable | Default | What it is for |
+|---|---|---|
+| `STATE_BACKEND` | `memory` (compose: `local`) | `memory` is still 002's amnesia, unchanged |
+| `STATE_DIR` | `/var/lib/order-state` | where the per-partition stores live |
+| `STATE_CHANGELOG_PREFIX` | `order-fold` | topics are `<prefix>.<group_id>` |
+| `STATE_REBUILD` | `full` | `checkpoint` resumes instead of replaying — compare the two `RESTORED` lines |
+| `FOLD_SEGMENT_MS` / `FOLD_MIN_CLEANABLE_DIRTY_RATIO` / `FOLD_DELETE_RETENTION_MS` | `10000` / `0.01` / `60000` | the changelog's cleaner, tunable apart from the snapshot's |
+
+`full` is the default even though Kafka Streams checkpoints: under `checkpoint` a warm
+restart reads nothing, and the number this feature exists to show would be visible exactly
+once.
+
+## What it forced elsewhere
+
+An embedded store takes an **exclusive lock** on its directory, so only the process holding
+a partition can write that partition's fold. The retry worker used to write folds directly
+— possible only because a database accepts connections from anywhere. It is now a pure
+**scheduler**: it waits out the backoff and republishes the message to the topic it came
+from, where the owning instance runs the handler and folds it.
+
+Two headers make that safe. `x-retry-target` names the one service the retry is for, so the
+other two groups do not re-run handlers that already succeeded. `x-attempt` carries the
+attempt count forward, so a republished message cannot restart its budget and ping-pong
+between the two topics forever.
+
+**With local state, work travels to the state — not state to the worker.**
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| The changelog produce and the offset commit are still two operations | 008 — one transaction covers both, which a database write never could |
+| `handled_count` still exceeds `last_sequence` | 008 |
+| A deliberate replay from earliest still resurrects a deleted order | needs an `ORDER_DELETED` terminal event; 006 placed it out of scope |
+| A rebuild longer than `max.poll.interval.ms` evicts the member mid-restore | inherent; `STATE_REBUILD=checkpoint` is the mitigation |
+| The event log now carries republished messages the producer never wrote | accepted; the alternative puts the backoff wait back in the consume loop |
+| 005's `R5.9` still describes the worker folding state itself | wording needs amending; see [X13](DECISIONS.md) |

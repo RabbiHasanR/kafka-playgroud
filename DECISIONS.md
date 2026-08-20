@@ -448,3 +448,45 @@ where replays already see them, but needs a new `EventType`, a terminal `OrderSt
 `LEGAL_PREDECESSOR` table that can express "from any state" — a change to the shared event
 contract that 006 is too small to justify. It remains available to 007 if the changelog rebuild
 turns out to want it.
+
+---
+
+## X13 — The changelog is one compacted topic per consumer group
+
+**Date:** 2026-08-20 **Status:** accepted **Specs:** 007, amends X12, confirms X5
+
+**Context.** [X5](#x5--derived-state-ends-at-rocksdb--a-compacted-changelog-topic) promised
+"a compacted changelog topic keyed identically to the state".
+[X12](#x12--order-snapshot-is-the-table-and-is-what-007-will-rebuild-state-from) then said
+`order-snapshot` *was* that topic. Building 007 showed the two cannot both be true.
+
+**Decision.** Three topics, `order-fold.<group_id>`, each `cleanup.policy=compact`, keyed by
+`order_id`, co-partitioned with `order-lifecycle`. `order-snapshot` keeps exactly its 006 role
+— the producer's table, read by the consumers for its tombstones and nothing else.
+
+**Consequences.** The fold is per `(group_id, order_id)` because the three services walk an
+order's stages at their own pace, and compaction retains the latest value **per key**. One
+topic keyed by `order_id` would have the groups overwrite one another, and every rebuild would
+read whichever group wrote last. Putting the group in the key instead fixes compaction and
+breaks partitioning — the key is what the partitioner hashes, so an order's fold and its events
+would land on different partition numbers and the single-partition rebuild would be impossible.
+The group therefore goes in the topic name. This is what Kafka Streams does, one changelog per
+store per `application.id`, and 009's ksqlDB will create the same shape.
+
+X5's `rocksdict` choice was checked rather than assumed on arrival, as X5 asked: version 0.3.29
+publishes a `cp313` manylinux wheel that installs into `python:3.13-slim`, and the exclusive
+directory lock the design depends on is real. No fallback was needed.
+
+**Consequence that reaches backwards.** 005's `R5.9` says the retry worker "SHALL select the
+handler … and SHALL fold the result into that service's consumer-group state". An embedded
+store cannot be opened by a process that does not own the partition, so a worker holding no
+partitions can fold nothing. R7.12 states the prohibition and the worker became a scheduler
+that republishes instead. R5.9's *intent* is intact — the right service's handler runs and the
+right group's state is folded — but the location moved, and R5.9's wording has not been
+amended, because `requirements.md` is not amended without the user's say-so.
+
+**Rejected.** Keying one topic `group_id|order_id` and producing with an explicit partition to
+restore co-partitioning — it works, but the rebuild then reads all three groups' folds and
+discards two-thirds, and the explicit partition is a footgun the moment anyone forgets it.
+Reusing `order-snapshot`, per X12 — it carries no per-group `last_sequence` and no
+`handled_count`, so bootstrapping from it merges three memories R3.2 requires to stay separate.

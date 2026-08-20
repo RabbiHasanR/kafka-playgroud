@@ -16,6 +16,15 @@ member evicted, the partition reassigned, and the message redelivered — the fa
 has its partition **paused** and its offset **sought back to**, and the loop keeps calling
 ``poll()``, which returns nothing for a paused partition and everything for the others.
 
+**What it stopped doing at 007.** It used to run the handler and fold the result into
+that service's state itself, which a shared database allowed. An embedded store does not:
+only the process holding a partition can write that partition's fold (R7.12). So the
+worker is now purely a **scheduler** — it does the waiting, and when a message is due it
+republishes it to the topic it came from, where the instance that owns the partition runs
+the handler and folds through the ordinary path. Everything downstream of that (a further
+failure, the attempt budget, the dead-letter route) is the consumer's existing logic, not
+a second copy here.
+
 **Known gap (D14).** One topic carrying per-message delays can invert: a message due in
 120s sits at the head of a partition and holds up messages behind it that are due in 30s.
 Tiered delay topics are the fix and are deliberately not built, so the stall is watchable.
@@ -37,7 +46,6 @@ from confluent_kafka import (
 )
 
 from order_service.config import Settings, get_settings
-from order_service.consumer import failures
 from order_service.consumer.dlq import (
     HDR_ATTEMPT,
     HDR_RETRY_AT,
@@ -47,16 +55,14 @@ from order_service.consumer.dlq import (
     Origin,
     decode_headers,
 )
-from order_service.consumer.errors import NonRetryableError, classify
-from order_service.consumer.main import SERVICE_REGISTRY, build_store
+from order_service.consumer.errors import NonRetryableError
+from order_service.consumer.main import SERVICE_REGISTRY
 from order_service.consumer.runtime import (
     ConsumerConfigError,
     ServiceSpec,
-    apply_event,
     build_consumer_config,
     key_of,
 )
-from order_service.consumer.state import StateStore, StateStoreUnavailable
 from order_service.events import LifecycleEvent, utc_now
 
 logger = logging.getLogger("order_service.retry_worker")
@@ -73,17 +79,17 @@ class RetryWorker:
         self,
         settings: Settings,
         specs: dict[str, ServiceSpec],
-        stores: dict[str, StateStore],
         router: FailureRouter,
     ) -> None:
         """Build the worker.
 
         Args:
             settings: Resolved environment settings.
-            specs: Every service this worker can run, by name — the routing table.
-            stores: One store per service, each keyed by **that service's** group id, so
-                a retry that succeeds writes the rows the main consumer would have (D5).
-            router: Where a message goes when it fails again, or runs out of attempts.
+            specs: Every service this worker can route to, by name. Still needed even
+                though handlers no longer run here (R7.12): a message naming no known
+                service is a poison message this worker must recognise.
+            router: Where a message goes when it is due, and where it goes when nothing
+                can be done with it.
 
         Raises:
             ConsumerConfigError: If the settings are incompatible with the selected group
@@ -91,7 +97,6 @@ class RetryWorker:
         """
         self._settings = settings
         self._specs = specs
-        self._stores = stores
         self._router = router
         self._running = False
         #: Partitions paused until their head message is due, by (topic, partition).
@@ -257,106 +262,53 @@ class RetryWorker:
             )
             return
 
+        self._release(message, spec, event, origin, attempt)
+
+    def _release(
+        self,
+        message: Message,
+        spec: ServiceSpec,
+        event: LifecycleEvent,
+        origin: Origin,
+        attempt: int,
+    ) -> None:
+        """Put a due message back where the partition's owner will read it (R7.12, R7.13).
+
+        The handler is deliberately **not** run here. Running it here and republishing
+        would do the work twice; running it here and folding locally is what 007 made
+        impossible. So this loop's whole contribution is the waiting.
+
+        A failed republish is not committed, so the message is redelivered and the wait is
+        served again — at-least-once, exactly as a failed retry publication already
+        behaved (R5.6).
+        """
         try:
-            failures.maybe_fail(self._settings, event, attempt=attempt)
-            handler = spec.handlers.get(event.event_type)
-            if handler is not None:
-                handler(event)
-        except StateStoreUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 — classify() decides, not the type here
-            self._on_attempt_failed(message, origin, service, attempt, exc)
+            topic = self._router.to_source(
+                message,
+                origin=origin,
+                service=spec.name,
+                group_id=self._settings.group_id_for(spec.name),
+                attempt=attempt,
+            )
+        except FailurePublishFailed as exc:
+            logger.error(
+                "[retry-worker] RETRY_RELEASE_FAILED service=%s order_id=%s attempt=%d "
+                "reason=%s — not committing, will be redelivered",
+                spec.name,
+                event.order_id,
+                attempt,
+                exc,
+            )
             return
 
-        self._succeed(message, spec, event, attempt)
-
-    def _succeed(
-        self, message: Message, spec: ServiceSpec, event: LifecycleEvent, attempt: int
-    ) -> None:
-        """Fold a recovered event into its service's state and commit.
-
-        Raises:
-            StateStoreUnavailable: If the fold cannot be written — deliberately not
-                caught, for the reason R3.22 gives.
-        """
-        store = self._stores[spec.name]
-        partition = message.partition()
-
-        # Drop the cache before reading. PostgresStateStore's read-through cache is
-        # licensed by "a partition belongs to exactly one member" (003) — an invariant
-        # this worker breaks, because it is a second reader of orders the main consumer
-        # is still advancing. Forgetting first turns every load into a real read (D5).
-        store.forget([partition])
-        current = store.load(partition, event.order_id)
-
-        # Violations are deliberately not re-logged: the main consumer already reported
-        # them for this message when the first attempt failed, and the fold has not moved
-        # since. What is new here is that the work finally happened.
-        updated, _violations = apply_event(current, event)
-        store.save(partition, event.order_id, updated, event.event_id)
-
         logger.warning(
-            "[retry-worker] RETRY_SUCCEEDED service=%s order_id=%s seq=%d attempt=%d",
+            "[retry-worker] RETRY_RELEASED service=%s order_id=%s seq=%d attempt=%d "
+            "topic=%s",
             spec.name,
             event.order_id,
             event.sequence,
             attempt,
-        )
-        self._commit(message)
-
-    def _on_attempt_failed(
-        self,
-        message: Message,
-        origin: Origin,
-        service: str,
-        attempt: int,
-        exc: BaseException,
-    ) -> None:
-        """Schedule the next attempt, or give up if this was the last one (R5.10)."""
-        non_retryable = classify(exc) is NonRetryableError
-        if non_retryable:
-            self._give_up(
-                message,
-                origin=origin,
-                service=service,
-                attempt=attempt,
-                exc=exc,
-                marker="POISON_MESSAGE",
-            )
-            return
-        if attempt >= self._settings.retry_max_attempts:
-            self._give_up(
-                message,
-                origin=origin,
-                service=service,
-                attempt=attempt,
-                exc=exc,
-                marker="RETRY_EXHAUSTED",
-            )
-            return
-
-        try:
-            due_at = self._router.to_retry(
-                message,
-                origin=origin,
-                service=service,
-                group_id=self._settings.group_id_for(service),
-                attempt=attempt + 1,
-                error=exc,
-            )
-        except FailurePublishFailed as publish_error:
-            self._rewind(message, publish_error)
-            return
-
-        logger.warning(
-            "[retry-worker] RETRY_SCHEDULED service=%s key=%s attempt=%d of %d due=%s error=%s: %s",
-            service,
-            key_of(message),
-            attempt + 1,
-            self._settings.retry_max_attempts,
-            due_at.isoformat(),
-            type(exc).__name__,
-            exc,
+            topic,
         )
         self._commit(message)
 
@@ -457,26 +409,15 @@ def main() -> None:
     settings = get_settings()
 
     specs = {name: factory() for name, factory in SERVICE_REGISTRY.items()}
-    stores: dict[str, StateStore] = {}
-    try:
-        for name in specs:
-            # Keyed by the SERVICE's group, not the worker's: a retry that succeeds must
-            # land in the rows the main consumer would have written (R5.9, D5).
-            stores[name] = build_store(settings, group_id=settings.group_id_for(name))
-    except StateStoreUnavailable as exc:
-        logger.error("[retry-worker] %s", exc)
-        for store in stores.values():
-            store.close()
-        sys.exit(2)
 
+    # No state stores here since 007. The worker holds no partition, so it may write no
+    # fold (R7.12); it republishes and the owning consumer does both.
     router = FailureRouter(settings)
     try:
-        worker = RetryWorker(settings, specs, stores, router)
+        worker = RetryWorker(settings, specs, router)
     except ConsumerConfigError as exc:
         logger.error("[retry-worker] %s", exc)
         router.close()
-        for store in stores.values():
-            store.close()
         sys.exit(2)
 
     def shutdown(signum: int, _frame: FrameType | None) -> None:
@@ -491,13 +432,8 @@ def main() -> None:
     except KafkaException as exc:
         logger.error("[retry-worker] fatal kafka error: %s", exc)
         sys.exit(1)
-    except StateStoreUnavailable as exc:
-        logger.error("[retry-worker] STATE_STORE_UNAVAILABLE reason=%s", exc)
-        sys.exit(1)
     finally:
         router.close()
-        for store in stores.values():
-            store.close()
 
 
 if __name__ == "__main__":

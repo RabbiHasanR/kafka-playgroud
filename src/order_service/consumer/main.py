@@ -24,8 +24,8 @@ from order_service.consumer.runtime import (
     ServiceSpec,
 )
 from order_service.consumer.state import (
+    LocalStateStore,
     MemoryStateStore,
-    PostgresStateStore,
     StateStore,
     StateStoreUnavailable,
 )
@@ -62,28 +62,24 @@ def build_spec(service_name: str) -> ServiceSpec:
 
 
 def build_store(settings: Settings, group_id: str) -> StateStore:
-    """Build the state store this process will fold into (003 D8).
+    """Build the state store this process will fold into (003 D8, 007 D2).
 
     Args:
         settings: Resolved environment settings.
-        group_id: The consumer group whose memory this store holds — part of the durable
-            primary key, so the three services stay independent (R3.2).
+        group_id: The consumer group whose memory this store holds. It names both the
+            store's directory and its changelog topic, so the three services stay
+            independent (R3.2).
 
     Returns:
         The store selected by ``STATE_BACKEND``.
 
     Raises:
-        StateStoreUnavailable: If the durable backend is selected and the database
-            cannot be reached, or ``STATE_DB_DSN`` is unset.
+        StateStoreUnavailable: If the local backend is selected and its state directory
+            cannot be used.
     """
     if settings.state_backend is StateBackend.MEMORY:
         return MemoryStateStore()
-
-    if settings.state_db_dsn is None:
-        raise StateStoreUnavailable(
-            "STATE_BACKEND=postgres requires STATE_DB_DSN — see .env.example"
-        )
-    return PostgresStateStore(settings.state_db_dsn, group_id=group_id)
+    return LocalStateStore(settings, group_id=group_id)
 
 
 def main() -> None:

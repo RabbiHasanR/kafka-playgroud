@@ -118,8 +118,6 @@ x-notification-consumer: &notification-consumer
       condition: service_healthy
     kafka-3:
       condition: service_healthy
-    postgres:
-      condition: service_healthy
 
 x-notification-env: &notification-env
   KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
@@ -157,28 +155,31 @@ x-failure-env: &failure-env
   HANDLER_FAILURE_ORDERS: ${HANDLER_FAILURE_ORDERS:-}
   HANDLER_FAILURE_ATTEMPTS: ${HANDLER_FAILURE_ATTEMPTS:-2}
 
-# --- spec 003: the durable state store, written once for all five consumers ------
+# --- spec 007: the local state store, written once for all five consumers --------
 # STATE_BACKEND defaults to `memory` in config.py so a bare `python -m
 # order_service.consumer.main` still reproduces 001's and 002's recorded results
 # (003 D8). Compose turns it on explicitly — the assembled system runs the durable path.
 #
-# The DSN is built here rather than passed as five discrete settings so psycopg's own
-# parser stays in charge and compose has one string to keep consistent. `${VAR:?...}`
-# rather than `${VAR:-default}`: a default password is still a hardcoded credential
-# (003 D13, R3.24). Copy .env.example to .env before the first `up`.
+# There is no DSN and no credential here any more. 003's Postgres fold was always the
+# knowingly-weaker option (X4) and 007 replaced it with an embedded store on each
+# instance's own disk, made durable by a compacted changelog topic (X5). What used to be
+# one shared table is now `STATE_DIR/<group_id>/<partition>/` inside each container.
 #
-# From the host the same consumer uses @localhost:5432 instead of @postgres:5432 and
-# changes nothing else — the shape R1.44 established for the broker (R3.26).
-#
-# The two levers (STATE_WRITE_ORDER, STATE_CRASH_AFTER) are deliberately NOT here.
-# They are set per-experiment on ONE instance, the way 002 sets HANDLER_DELAY_SECONDS.
-x-state-db-env: &state-db-env
+# The three levers (STATE_WRITE_ORDER, STATE_CRASH_AFTER, STATE_REBUILD) are deliberately
+# NOT here. They are set per-experiment on ONE instance, the way 002 sets
+# HANDLER_DELAY_SECONDS.
+x-state-env: &state-env
   # Overridable so the whole group can be flipped back to 002's in-process state in one
   # variable, which is what makes the before/after comparison a single change:
   #   STATE_BACKEND=memory docker compose --profile scale-out up -d
   # Same shape as CONSUMER_GROUP_PROTOCOL above, and for the same reason.
-  STATE_BACKEND: ${STATE_BACKEND:-postgres}
-  STATE_DB_DSN: postgresql://${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+  STATE_BACKEND: ${STATE_BACKEND:-local}
+  STATE_DIR: ${STATE_DIR:-/var/lib/order-state}
+  # Must match scripts/create_topics.sh, which builds the same topic names from the same
+  # default. A consumer pointed at a changelog nobody created fails at its first restore
+  # rather than folding into nothing, because auto-creation is off.
+  STATE_CHANGELOG_PREFIX: ${STATE_CHANGELOG_PREFIX:-order-fold}
+  STATE_REBUILD: ${STATE_REBUILD:-full}
 
 services:
   # --- spec 004: the three-broker cluster ---------------------------------
@@ -228,42 +229,6 @@ services:
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:19092,EXTERNAL://localhost:9095
     volumes:
       - kafka3-data:/var/lib/kafka/data
-
-  # --- spec 003: the durable consumer state store -------------------------
-  # Holds order_fold ONLY — the consumers' derived memory. The producer's
-  # OrderStore stays in memory by design (003 D12): it is source-of-truth
-  # state whose fix is a transactional outbox, not a table, and the topic is
-  # already the source of truth for everything stored here.
-  #
-  # 5432 is published to the host for the same reason 9092 is: an experiment
-  # can run in compose and be inspected with psql from outside it.
-  #
-  # NOTE: the initdb mount below runs ONLY when the volume is empty. After the
-  # first `up`, schema changes need scripts/apply_state_schema.sh (003 D11).
-  postgres:
-    image: postgres:17-alpine
-    container_name: postgres
-    ports:
-      # Overridable because a developer machine very often already runs Postgres on
-      # 5432, and a port clash should be one .env line rather than a reason to stop
-      # publishing. The container side never moves, so STATE_DB_DSN is unaffected.
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
-      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./scripts/state_schema.sql:/docker-entrypoint-initdb.d/state_schema.sql:ro
-    healthcheck:
-      # -U/-d matter: the default `pg_isready` probes the `postgres` database as
-      # the `postgres` role, which need not exist here, so it can report healthy
-      # while the database the consumers use is still starting.
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -319,12 +284,18 @@ services:
   inventory-consumer:
     <<: *consumer-image
     container_name: inventory-consumer
+    # spec 007 — its OWN volume, not a shared one. Co-partitioned state means
+    # each instance holds only the partitions it owns; one volume across five
+    # containers would put them back on one filesystem, and the embedded store's
+    # exclusive lock would then stop the second container starting at all.
+    volumes:
+      - inventory-state:${STATE_DIR:-/var/lib/order-state}
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
-      <<: [*topics-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *state-env, *failure-env]
     depends_on: *consumer-deps
 
   # --- spec 002: notification scales out ----------------------------------
@@ -343,38 +314,46 @@ services:
   notification-consumer-1:
     <<: *notification-consumer
     container_name: notification-consumer-1
+    volumes:
+      - notification1-state:${STATE_DIR:-/var/lib/order-state}
     environment:
-      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-1
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
 
   notification-consumer-2:
     <<: *notification-consumer
     container_name: notification-consumer-2
+    volumes:
+      - notification2-state:${STATE_DIR:-/var/lib/order-state}
     profiles: ["scale-out"]
     environment:
-      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-2
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
 
   notification-consumer-3:
     <<: *notification-consumer
     container_name: notification-consumer-3
+    volumes:
+      - notification3-state:${STATE_DIR:-/var/lib/order-state}
     profiles: ["scale-out"]
     environment:
-      <<: [*topics-env, *notification-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env]
       CONSUMER_INSTANCE_ID: notification-3
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
   analytics-consumer:
     <<: *consumer-image
     container_name: analytics-consumer
+    volumes:
+      - analytics-state:${STATE_DIR:-/var/lib/order-state}
     command: python -m order_service.consumer.main
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
-      <<: [*topics-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *state-env, *failure-env]
     depends_on: *consumer-deps
 
   # --- spec 005: the process that does the waiting ------------------------
@@ -386,8 +365,12 @@ services:
   # thing the three consume loops must never do. Nothing this container does can
   # reach them.
   #
-  # It sets no CONSUMER_GROUP_ID — that would collapse the three services' state
-  # stores onto one group id and merge memories that must stay separate (D5).
+  # It sets no CONSUMER_GROUP_ID — that would collapse the three services' offsets onto
+  # one group id and merge positions that must stay separate (005 D5).
+  #
+  # It has NO state volume, and that is the 007 change: the worker holds no partition, so
+  # it may write no fold (R7.12). It waits out the backoff and republishes; the consumer
+  # that owns the partition runs the handler and folds.
   retry-worker:
     <<: *consumer-image
     container_name: retry-worker
@@ -395,11 +378,17 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       CONSUMER_INSTANCE_ID: retry-worker
-      <<: [*topics-env, *state-db-env, *failure-env]
+      <<: [*topics-env, *state-env, *failure-env]
     depends_on: *consumer-deps
 
 volumes:
   kafka-data:
   kafka2-data:
   kafka3-data:
-  postgres-data:
+  # spec 007 — one per consumer instance, holding that instance's own partitions' stores.
+  # Losing one costs a rebuild from the changelog, not the state.
+  inventory-state:
+  notification1-state:
+  notification2-state:
+  notification3-state:
+  analytics-state:

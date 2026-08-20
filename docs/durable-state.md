@@ -2,6 +2,14 @@
 
 > Spec [003](../specs/003-durable-consumer-state/requirements.md). Companion to
 > [order-flow.md](order-flow.md) (001) and [consumer-groups.md](consumer-groups.md) (002).
+>
+> **The Postgres backend this describes was replaced at
+> [007](../specs/007-local-state-stores-changelog/requirements.md).** That was always the
+> plan ([X4](../DECISIONS.md)): a database makes the dual-write problem impossible to miss,
+> which is why it was chosen knowing it was the weaker option. The distinction this
+> document draws — position versus memory — is unchanged and is why the rung exists. Where
+> the memory *lives* is now [local-state-and-changelog.md](local-state-and-changelog.md),
+> and `scripts/state_schema.sql` and `scripts/apply_state_schema.sh` no longer exist.
 
 ## The distinction the whole feature rests on
 

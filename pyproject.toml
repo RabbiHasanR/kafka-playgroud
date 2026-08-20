@@ -13,9 +13,11 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    # spec 003 — the durable consumer state store. Only the consumer uses it; the
-    # producer's OrderStore stays in memory by design (003 D12).
-    "psycopg[binary]>=3.2",
+    # spec 007 — the embedded local state store. Only the consumer uses it; the
+    # producer's OrderStore stays in memory by design (003 D12). RocksDB is what Kafka
+    # Streams keeps its state in, so 009's ksqlDB state directories will be recognisable
+    # rather than opaque (X5).
+    "rocksdict>=0.3.29",
 ]
 
 [tool.setuptools.packages.find]

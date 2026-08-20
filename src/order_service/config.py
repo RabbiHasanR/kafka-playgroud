@@ -22,16 +22,33 @@ class GroupProtocol(StrEnum):
 
 
 class StateBackend(StrEnum):
-    """Where a consumer keeps its folded per-order state (003 D8).
+    """Where a consumer keeps its folded per-order state (003 D8, 007 D2).
 
     ``MEMORY`` is the default so that a consumer started with none of spec 003's
     settings behaves exactly as 002 recorded, keeping 001's and 002's experiments
-    reproducible without a database running (R3.20, R3.27). Compose sets ``POSTGRES``
+    reproducible without any store at all (R3.20, R3.27). Compose sets ``LOCAL``
     explicitly, so the assembled system runs the durable path.
+
+    ``LOCAL`` replaced ``POSTGRES`` at 007 (X5, R7.14). The fold now lives in an
+    embedded store on the instance's own disk, one per owned partition, and is made
+    durable by a compacted changelog topic rather than by a shared database.
     """
 
     MEMORY = "memory"
-    POSTGRES = "postgres"
+    LOCAL = "local"
+
+
+class StateRebuild(StrEnum):
+    """How much of the changelog a store replays when it is assigned a partition (007 D8).
+
+    ``FULL`` is the default even though Kafka Streams checkpoints, because under
+    ``CHECKPOINT`` a warm restart reads almost nothing and the number this feature
+    exists to show — records read versus keys restored — is then visible exactly once,
+    on a cold start. The lever exists so the contrast can be measured (R7.9).
+    """
+
+    FULL = "full"
+    CHECKPOINT = "checkpoint"
 
 
 class StateWriteOrder(StrEnum):
@@ -138,12 +155,22 @@ class Settings(BaseSettings):
         consumer_instance_id_static: Sets ``group.instance.id`` for static membership.
             An empty value means unset, because Compose interpolation yields ``""``
             rather than removing the variable.
-        state_backend: Where folded state lives (003 D8). Defaults to ``memory``, which
-            is 002's behaviour; compose sets ``postgres``.
-        state_db_dsn: libpq connection string, required when the backend is
-            ``postgres``. Empty means unset, for the same Compose reason as above.
+        state_backend: Where folded state lives (003 D8, 007 D2). Defaults to
+            ``memory``, which is 002's behaviour; compose sets ``local``.
+        state_dir: Root of the embedded stores, one directory per owned partition
+            underneath ``<state_dir>/<group_id>/`` (007 D2). Local disk, deliberately
+            not a shared mount — a shared one would reintroduce the contention this
+            backend removes.
+        state_changelog_prefix: Prefix of the per-group changelog topics, which are
+            named ``<prefix>.<group_id>`` (007 D1). One topic per consumer group and
+            not one keyed by order, because compaction retains the latest value per key
+            and the three groups fold the same order at different sequences.
+        state_rebuild: Whether an assigned partition replays its whole changelog or
+            resumes from the checkpoint (007 D8).
         state_write_order: Which of the state write and the offset commit goes first
-            (003 D4). The default is the correct one; the other is a lever.
+            (003 D4). Both are Kafka operations from 007, which is what makes 008's
+            transaction able to cover them. The default is the correct one; the other
+            is a lever.
         state_crash_after: Where to kill the process on purpose, to open the dual-write
             window (003 D5). Defaults to not crashing.
         producer_acks: How many replicas must acknowledge a write (004 D5). Defaults to
@@ -190,9 +217,13 @@ class Settings(BaseSettings):
 
     # -- spec 003: durable consumer state, and the two levers -------------------
     state_backend: StateBackend = StateBackend.MEMORY
-    state_db_dsn: str | None = None
     state_write_order: StateWriteOrder = StateWriteOrder.STATE_FIRST
     state_crash_after: StateCrashPoint = StateCrashPoint.NONE
+
+    # -- spec 007: the local store and its changelog ----------------------------
+    state_dir: str = "/var/lib/order-state"
+    state_changelog_prefix: str = "order-fold"
+    state_rebuild: StateRebuild = StateRebuild.FULL
 
     # -- spec 004: the producer's half of the durability contract ---------------
     producer_acks: ProducerAcks = ProducerAcks.ALL
@@ -221,7 +252,6 @@ class Settings(BaseSettings):
         "consumer_assignment_strategy",
         "consumer_remote_assignor",
         "consumer_instance_id_static",
-        "state_db_dsn",
         "handler_failure_orders",
         mode="before",
     )
@@ -240,6 +270,23 @@ class Settings(BaseSettings):
     def group_id_for(self, service_name: str) -> str:
         """Return the configured group id, or ``<service_name>-service``."""
         return self.consumer_group_id or f"{service_name}-service"
+
+    def changelog_topic_for(self, group_id: str) -> str:
+        """Return the changelog topic holding one consumer group's folded state (R7.1).
+
+        Derived from the group id rather than the service name, so overriding
+        ``CONSUMER_GROUP_ID`` moves the changelog with the group instead of stranding
+        the new group on the old group's state. ``scripts/create_topics.sh`` builds the
+        same names from the same defaults; a non-default group id needs its topic
+        created by hand, which auto-creation being off makes loud rather than silent.
+
+        Args:
+            group_id: The consumer group whose memory this topic carries.
+
+        Returns:
+            The topic name, ``<state_changelog_prefix>.<group_id>``.
+        """
+        return f"{self.state_changelog_prefix}.{group_id}"
 
     @property
     def instance_label(self) -> str:

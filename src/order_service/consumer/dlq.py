@@ -35,6 +35,10 @@ HDR_ORIGINAL_PARTITION = "x-original-partition"
 HDR_ORIGINAL_OFFSET = "x-original-offset"
 HDR_ORIGINAL_TIMESTAMP = "x-original-timestamp"
 HDR_ATTEMPT = "x-attempt"
+#: 007 R7.13 — set only on a message the retry worker puts BACK on the source topic. It
+#: names the one service the retry is for, because the source topic fans out to all three
+#: and the other two already succeeded on this message.
+HDR_RETRY_TARGET = "x-retry-target"
 HDR_RETRY_AT = "x-retry-at"
 HDR_ATTEMPTS_MADE = "x-attempts-made"
 HDR_ERROR_CLASS = "x-error-class"
@@ -208,6 +212,57 @@ class FailureRouter:
             },
         )
         return due_at
+
+    def to_source(
+        self,
+        message: Message,
+        *,
+        origin: Origin,
+        service: str,
+        group_id: str,
+        attempt: int,
+    ) -> str:
+        """Put a due message back on the topic it came from, for its owner to fold (R7.12).
+
+        This exists because state stopped being shareable at 007. An embedded store takes
+        an exclusive lock on its directory, so only the process holding a partition can
+        write that partition's fold — and the retry worker holds none of them. The work
+        therefore travels to the state instead of the state travelling to the worker.
+
+        Two headers make a republished message safe to fan out:
+
+        ``x-retry-target``
+            names the one service this retry is for. Without it the two groups that
+            already handled this message successfully would run their handlers again.
+        ``x-attempt``
+            carries the attempt number forward. Without it the message would arrive as a
+            fresh attempt 1, and with a failure lever still armed it would fail, be
+            scheduled again, and ping-pong between the two topics forever.
+
+        Args:
+            message: The due message; its key and value are republished as-is.
+            origin: Where the message was first published — the topic it goes back to.
+            service: The service whose handler is to run it.
+            group_id: The consumer group that originally failed, for provenance.
+            attempt: The 1-based attempt this republication is spending.
+
+        Returns:
+            The topic the message was published back to.
+
+        Raises:
+            FailurePublishFailed: If the broker did not acknowledge the publication, so
+                the caller does not commit and the message is redelivered.
+        """
+        self._publish(
+            topic=origin.topic,
+            message=message,
+            headers={
+                **self._provenance(origin, service, group_id),
+                HDR_ATTEMPT: str(attempt),
+                HDR_RETRY_TARGET: service,
+            },
+        )
+        return origin.topic
 
     def to_dead_letter(
         self,

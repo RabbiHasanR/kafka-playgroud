@@ -1,44 +1,86 @@
-"""Where a consumer's folded per-order state lives (spec 003).
+"""Where a consumer's folded per-order state lives (specs 003 and 007).
 
 Kafka remembers a consumer's **position** — the committed offset. Nothing in 001 or 002
 remembered its **memory** — the per-order fold — so a restart or a rebalance produced
 sequence-gap violations that never happened. This module is where that memory goes.
 
-Two backends behind one protocol (D2):
+Two backends behind one protocol (003 D2):
 
 ``MemoryStateStore``
     002's behaviour, lifted out unchanged. It is the control for every experiment that
     compares before and after, so it is deliberately **not** improved on the way past.
 
-``PostgresStateStore``
-    The durable one. Keyed by ``(group_id, order_id)`` and **never by partition** (D1) —
-    which is the whole reason a partition can move between members without its orders
-    losing their history.
+``LocalStateStore``
+    The durable one, since 007. An embedded RocksDB store on the instance's own disk,
+    **one per owned partition**, made durable by a compacted changelog topic keyed
+    identically to the state. It replaced ``PostgresStateStore``, which held the same
+    folds in one shared table (X4, X5).
 
-The offset still commits to Kafka and the fold now writes to Postgres, so there are two
-writes to two systems and no operation covering both. That gap is this feature's subject:
-:meth:`PostgresStateStore.save` absorbs it in the state with a guarded upsert, and
-``handled_count`` counts what the guard does *not* absorb — the duplicate side effect,
-which is 008's to remove (X4).
+Three things changed at 007 and each is load-bearing.
+
+**State is co-partitioned with input.** The instance holding partition 2 holds exactly
+partition 2's keys, in ``<state_dir>/<group_id>/2/``, behind an exclusive lock no other
+process can take. There is no shared server, so there is no contention and no way to read
+another member's state by accident.
+
+**Local disk is not durable, and the changelog is what makes it recoverable.** Every
+mutation is also produced to ``<prefix>.<group_id>``, compacted and keyed by ``order_id``.
+:meth:`LocalStateStore.restore` rebuilds one partition by replaying that topic's partition
+of the same number — costing the number of **keys**, not the number of **events**, which
+is the whole point of 006 having established compaction first.
+
+**The changelog is per consumer group.** Compaction retains the latest value per key and
+the three services fold the same order at their own pace, so one topic keyed by
+``order_id`` would have them overwrite one another. The group therefore goes in the topic
+name; putting it in the key would put it in the partition hash and break co-partitioning.
+
+The offset still commits to Kafka and the fold now goes to a Kafka topic, so there are
+still two writes and nothing covering both — but both are now Kafka operations, which is
+what lets one transaction cover them at 008. ``handled_count`` still counts what the
+sequence guard absorbs, and is still the residue 008 drives to zero.
 """
 
-import re
+import json
+import logging
+import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
-import psycopg
+from confluent_kafka import (
+    Consumer,
+    KafkaError,
+    KafkaException,
+    Message,
+    Producer,
+    TopicPartition,
+)
+from rocksdict import Rdict
 
+from order_service.config import Settings, StateRebuild
 from order_service.events import OrderState
+
+logger = logging.getLogger(__name__)
+
+#: How long a restore waits for the next changelog record before declaring the replay
+#: stalled. Same shape as ``dlq_replay``'s guard: a rebuild that cannot finish must fail
+#: loudly, because the alternative is folding against a half-built store.
+_RESTORE_STALL_SECONDS = 10.0
+
+#: How long ``get_watermark_offsets`` waits. A rebuild cannot start without knowing where
+#: the partition ends, so this failing is fatal to the assignment rather than skippable.
+_WATERMARK_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
 class OrderFold:
     """What a service has accumulated about one order.
 
-    Lives here rather than in ``runtime.py`` because ``PostgresStateStore`` builds one
-    from a database row, so the store needs the class at runtime and the import can only
-    point one way.
+    Lives here rather than in ``runtime.py`` because the durable store builds one from a
+    stored value, so the store needs the class at runtime and the import can only point
+    one way.
 
     Deliberately carries no ``handled_count``: that is the store's bookkeeping, and
     keeping it off the domain fold is what leaves ``apply_event()`` with no opinion about
@@ -95,6 +137,18 @@ class StateStore(Protocol):
         Distinct from :meth:`forget`, which releases a *partition* without destroying
         anything durable. This is the durable delete a tombstone asks for (R6.10).
         """
+        ...
+
+    def restore(self, partitions: Iterable[int]) -> None:
+        """Rebuild state for exactly these partitions before any of them is consumed.
+
+        Called from the assignment callback, and blocking on purpose: a store rebuilt
+        *after* messages have been processed is a store that missed them (R7.7).
+        """
+        ...
+
+    def flush(self) -> None:
+        """Make every write so far durable, before the caller commits an offset (R7.11)."""
         ...
 
     def forget(self, partitions: Iterable[int]) -> None:
@@ -155,6 +209,18 @@ class MemoryStateStore:
         self._handled.pop((partition, order_id), None)
         return removed is not None
 
+    def restore(self, partitions: Iterable[int]) -> None:
+        """Do nothing, deliberately (R3.20).
+
+        This backend **is** 002's amnesia. Rebuilding here would erase the "before" half
+        of every experiment 003 and 007 are measured against, so the one thing this
+        method must not do is work.
+        """
+        del partitions
+
+    def flush(self) -> None:
+        """Do nothing — there is nothing to make durable, which is the point (R3.20)."""
+
     def forget(self, partitions: Iterable[int]) -> None:
         """Forget everything about these partitions (R2.14).
 
@@ -174,228 +240,568 @@ class MemoryStateStore:
         """Nothing to release."""
 
 
-#: The whole idempotency mechanism, in one atomic statement (D6, D3): folds advance
-#: only on a higher sequence (R3.11, R3.12); handled_count counts each delivery (R3.13).
-#: The ``previous`` CTE carries the pre-write sequence, which ``RETURNING`` cannot.
-_UPSERT_FOLD = """
-    WITH previous AS (
-        SELECT last_sequence
-          FROM order_fold
-         WHERE group_id = %(group_id)s AND order_id = %(order_id)s
-    ), upserted AS (
-        INSERT INTO order_fold (
-            group_id, order_id, last_sequence, state, last_event_id, handled_count
-        )
-        VALUES (%(group_id)s, %(order_id)s, %(sequence)s, %(state)s, %(event_id)s, 1)
-        ON CONFLICT (group_id, order_id) DO UPDATE SET
-            last_sequence = GREATEST(order_fold.last_sequence, EXCLUDED.last_sequence),
-            state         = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
-                                 THEN EXCLUDED.state ELSE order_fold.state END,
-            last_event_id = CASE WHEN EXCLUDED.last_sequence > order_fold.last_sequence
-                                 THEN EXCLUDED.last_event_id
-                                 ELSE order_fold.last_event_id END,
-            handled_count = order_fold.handled_count + 1,
-            updated_at    = now()
-        RETURNING last_sequence, handled_count
-    )
-    SELECT upserted.last_sequence,
-           upserted.handled_count,
-           COALESCE(previous.last_sequence, 0) AS previous_sequence
-      FROM upserted LEFT JOIN previous ON true
-"""
+@dataclass(frozen=True)
+class _Record:
+    """One order's row in the local store: the fold plus the store's own bookkeeping.
 
-#: A tombstone's durable half (006 D6). A real DELETE, not a flag: the row that
-#: compaction erased from the topic must not survive in the table, or "deleted" stops
-#: meaning deleted in the one place this feature is about.
-_DELETE_FOLD = """
-    DELETE FROM order_fold
-     WHERE group_id = %(group_id)s AND order_id = %(order_id)s
-"""
-
-_SELECT_FOLD = """
-    SELECT last_sequence, state
-      FROM order_fold
-     WHERE group_id = %(group_id)s AND order_id = %(order_id)s
-"""
-
-#: Cheapest possible proof that the schema is there before the group is joined.
-_VERIFY_SCHEMA = "SELECT 1 FROM order_fold LIMIT 1"
-
-
-def redact_dsn(dsn: str) -> str:
-    """Return a connection string safe to put in a log line or an error.
-
-    An unredacted DSN in a startup error puts the password into every log aggregator
-    that ever sees it, so R3.21's "name the address it tried" has to stop short of the
-    credential. Handles both URL and ``key=value`` forms.
-
-    Args:
-        dsn: The connection string to redact.
-
-    Returns:
-        The same string with any password replaced by ``***``.
-    """
-    redacted = re.sub(r"(://[^:/?#@]+:)[^@]*(@)", r"\1***\2", dsn)
-    return re.sub(r"(password\s*=\s*)(\S+)", r"\1***", redacted)
-
-
-class PostgresStateStore:
-    """Durable fold state, with a read-through cache in front of it (D1, D3, D6).
-
-    The cache is licensed by a property 002 spent a whole feature establishing: a
-    partition belongs to exactly one member at a time, so the owner's cached folds cannot
-    go stale — nobody else is writing those orders.
-
-    Reads are lazy, on cache miss, and never warmed on assignment. Warming would cost a
-    scan proportional to history at every rebalance, which is precisely the cost 007
-    removes with a compacted changelog; paying it here would hide the problem 007 solves.
+    Split from :class:`OrderFold` for the reason 003 gave — the fold is what the service
+    knows, and ``last_event_id`` / ``handled_count`` are what the store records *about*
+    it. Keeping them apart is what leaves ``apply_event()`` with no opinion about
+    persistence.
     """
 
-    def __init__(self, dsn: str, group_id: str) -> None:
-        """Connect, and prove the schema is usable before anyone joins a group.
+    fold: OrderFold
+    last_event_id: str
+    handled_count: int
 
-        Args:
-            dsn: libpq connection string.
-            group_id: The consumer group whose memory this is. Part of the primary key,
-                so the three services' memories stay independent (R3.2).
+    def encode(self) -> bytes:
+        """Return the changelog value and the stored value — deliberately the same bytes.
+
+        One encoding, so a restore cannot disagree with a write about what was stored.
+        """
+        return json.dumps(
+            {
+                "last_sequence": self.fold.last_sequence,
+                "state": str(self.fold.state) if self.fold.state is not None else None,
+                "last_event_id": self.last_event_id,
+                "handled_count": self.handled_count,
+            }
+        ).encode("utf-8")
+
+    @classmethod
+    def decode(cls, order_id: str, raw: bytes) -> "_Record":
+        """Rebuild a record from stored or replayed bytes.
 
         Raises:
-            StateStoreUnavailable: If the database cannot be reached or ``order_fold``
-                does not exist.
+            StateStoreUnavailable: If the value is not the shape this module wrote. A
+                changelog that cannot be decoded is not a message-level failure and must
+                not be routed like one — it means the store is unusable (R3.22).
         """
-        self._dsn = dsn
+        try:
+            payload = json.loads(raw)
+            state = payload["state"]
+            return cls(
+                fold=OrderFold(
+                    order_id=order_id,
+                    last_sequence=int(payload["last_sequence"]),
+                    state=OrderState(state) if state is not None else None,
+                ),
+                last_event_id=payload["last_event_id"],
+                handled_count=int(payload["handled_count"]),
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise StateStoreUnavailable(
+                f"undecodable stored fold for {order_id}: {exc}"
+            ) from exc
+
+
+class LocalStateStore:
+    """Folded state on local disk, made durable by a compacted changelog (007 D2–D5).
+
+    One :class:`~rocksdict.Rdict` per **owned partition**, under
+    ``<state_dir>/<group_id>/<partition>/``. Partition first, and at the level of a whole
+    store rather than a key prefix, because that is what makes ownership physical: the
+    engine takes an exclusive lock on the directory, so a second process cannot open a
+    partition this instance holds. Releasing a partition is a ``close()``; listing what
+    is held is a directory listing.
+
+    There is **no read-through cache**, unlike the Postgres backend this replaced. After
+    :meth:`restore` the store *is* the warm copy, so a cache would be a second copy of
+    something already in memory-mapped local files.
+    """
+
+    def __init__(self, settings: Settings, group_id: str) -> None:
+        """Open the store root and the changelog producer.
+
+        Args:
+            settings: Resolved environment settings.
+            group_id: The consumer group whose memory this is. It names both the
+                directory and the changelog topic, so the three services' memories stay
+                independent exactly as their offsets are (R3.2).
+
+        Raises:
+            StateStoreUnavailable: If the state directory cannot be created.
+        """
+        self._settings = settings
         self._group_id = group_id
-        self._cache: dict[int, dict[str, OrderFold]] = {}
-        safe = redact_dsn(dsn)
+        self._topic = settings.changelog_topic_for(group_id)
+        self._root = Path(settings.state_dir) / group_id
         try:
-            self._conn = psycopg.connect(dsn, autocommit=True)
-        except psycopg.Error as exc:
+            self._root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
             raise StateStoreUnavailable(
-                f"state backend 'postgres' is unreachable at {safe}: {exc}"
+                f"state backend 'local' cannot use {self._root}: {exc}"
             ) from exc
-        try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(_VERIFY_SCHEMA)
-        except psycopg.Error as exc:
-            self._conn.close()
-            raise StateStoreUnavailable(
-                f"state backend 'postgres' at {safe} has no usable order_fold table "
-                f"({exc}) — run scripts/apply_state_schema.sh"
-            ) from exc
+
+        self._stores: dict[int, Rdict] = {}
+        #: Partition to the changelog offset the store has been brought up to. Seeded by
+        #: restore, advanced by delivery reports, written to the checkpoint on release.
+        self._position: dict[int, int] = {}
+
+        self._producer = Producer(
+            {
+                "bootstrap.servers": settings.kafka_bootstrap_servers,
+                # Hardcoded rather than following PRODUCER_ACKS (004 D5), for the same
+                # reason the failure router hardcodes it: this is the record that makes
+                # local disk recoverable, and losing it silently is the failure the
+                # whole backend exists to prevent.
+                "acks": "all",
+                # The SAME partitioner as the order producer. Equal partition counts plus
+                # one key and one partitioner are what put order X's fold and order X's
+                # events on the same partition NUMBER, which is what makes restoring one
+                # partition from one changelog partition correct (006 D8, 007 D1).
+                "partitioner": "consistent_random",
+                "client.id": f"{group_id}-changelog",
+            }
+        )
 
     @property
     def group_id(self) -> str:
         """Return the consumer group this store holds the memory of."""
         return self._group_id
 
+    @property
+    def changelog_topic(self) -> str:
+        """Return the topic this store's mutations are written to."""
+        return self._topic
+
+    # -- reads and writes -----------------------------------------------------------
+
     def load(self, partition: int, order_id: str) -> OrderFold | None:
-        """Return the fold for one order, reading through the cache on a miss.
+        """Return the fold for one order from the local store.
+
+        A plain local read: after :meth:`restore` every key this partition owns is
+        already here, so a miss means the order has genuinely never been seen.
 
         Raises:
-            StateStoreUnavailable: If the read fails.
+            StateStoreUnavailable: If the partition's store cannot be read.
         """
-        cached = self._cache.get(partition, {}).get(order_id)
-        if cached is not None:
-            return cached
-
-        try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(
-                    _SELECT_FOLD, {"group_id": self._group_id, "order_id": order_id}
-                )
-                row = cursor.fetchone()
-        except psycopg.Error as exc:
-            raise StateStoreUnavailable(f"reading {order_id}: {exc}") from exc
-
-        if row is None:
-            return None
-
-        last_sequence, state = row
-        fold = OrderFold(
-            order_id=order_id,
-            last_sequence=last_sequence,
-            state=OrderState(state) if state is not None else None,
-        )
-        self._cache.setdefault(partition, {})[order_id] = fold
-        return fold
+        record = self._read(partition, order_id)
+        return None if record is None else record.fold
 
     def save(
         self, partition: int, order_id: str, fold: OrderFold, event_id: str
     ) -> SaveOutcome:
-        """Write the fold under the sequence guard and count the delivery.
+        """Write the fold under the sequence guard, then publish it to the changelog.
+
+        The guard is read-modify-write here rather than 003's single atomic ``UPSERT``,
+        and that is safe for exactly one reason: **a partition has one writer**. That is
+        the invariant 002 established and R7.12 now states outright — and it is why the
+        retry worker republishes instead of writing folds of its own.
+
+        The changelog write does **not** wait for a delivery report. R7.11's ordering is
+        paid once per committed message by :meth:`flush`, not once per fold.
 
         Raises:
-            StateStoreUnavailable: If the write fails or returns nothing.
+            StateStoreUnavailable: If the store or the changelog cannot be written.
         """
-        params = {
-            "group_id": self._group_id,
-            "order_id": order_id,
-            "sequence": fold.last_sequence,
-            "state": str(fold.state) if fold.state is not None else None,
-            "event_id": event_id,
-        }
-        try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(_UPSERT_FOLD, params)
-                row = cursor.fetchone()
-        except psycopg.Error as exc:
-            raise StateStoreUnavailable(f"writing {order_id}: {exc}") from exc
+        previous = self._read(partition, order_id)
+        previous_sequence = 0 if previous is None else previous.fold.last_sequence
+        handled_count = 1 if previous is None else previous.handled_count + 1
 
-        if row is None:
-            raise StateStoreUnavailable(f"writing {order_id}: upsert returned no row")
-
-        _stored_sequence, handled_count, previous_sequence = row
-        # "Applied" means the fold ADVANCED, not that the write succeeded.
+        # "Applied" means the fold ADVANCED, not that the write succeeded — same
+        # distinction the SQL guard drew with GREATEST/CASE (003 D6).
         applied = fold.last_sequence > previous_sequence
-        if applied:
-            self._cache.setdefault(partition, {})[order_id] = fold
+        if applied or previous is None:
+            record = _Record(
+                fold=fold, last_event_id=event_id, handled_count=handled_count
+            )
+        else:
+            record = _Record(
+                fold=previous.fold,
+                last_event_id=previous.last_event_id,
+                handled_count=handled_count,
+            )
+
+        self._write(partition, order_id, record.encode())
         return SaveOutcome(applied=applied, handled_count=handled_count)
 
     def delete(self, partition: int, order_id: str) -> bool:
-        """Delete one order's row and evict it from the cache (R6.10).
+        """Erase one order locally and tombstone it on the changelog (R6.10, R7.6).
 
-        Note the contrast with :meth:`forget` directly below: that one drops the cache and
-        deliberately issues no ``DELETE``, because a rebalance must not destroy a memory.
-        This one is the opposite — a tombstone is an instruction to destroy it.
+        The changelog half is what stops the delete being undone by the next rebuild.
+        Note the contrast with :meth:`forget` below: that releases a partition without
+        destroying anything, because a rebalance must not destroy a memory. This is the
+        opposite — a tombstone is an instruction to destroy one.
 
         Args:
-            partition: The partition whose cache slot holds this order.
+            partition: The partition owning this order's store.
             order_id: The order to erase.
 
         Returns:
-            ``True`` if a row was actually deleted. ``False`` means the tombstone arrived
-            for an order this group had never folded, which is normal on a replay and is
-            not an error.
+            ``True`` if the order was actually present. ``False`` means the tombstone
+            arrived for an order this group had never folded, which is normal on a
+            replay and is not an error.
 
         Raises:
-            StateStoreUnavailable: If the delete fails.
+            StateStoreUnavailable: If the store or the changelog cannot be written.
         """
+        store = self._store_for(partition)
         try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(
-                    _DELETE_FOLD, {"group_id": self._group_id, "order_id": order_id}
-                )
-                deleted = cursor.rowcount
-        except psycopg.Error as exc:
+            existed = store.get(order_id) is not None
+            if existed:
+                del store[order_id]
+        except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
             raise StateStoreUnavailable(f"deleting {order_id}: {exc}") from exc
 
-        self._cache.get(partition, {}).pop(order_id, None)
-        return deleted > 0
+        # Published even when nothing was present, so that a member which never folded
+        # this order still records the delete for whoever rebuilds from here.
+        self._publish(partition, order_id, None)
+        return existed
+
+    def flush(self, timeout: float = 30.0) -> None:
+        """Block until every buffered changelog record is acknowledged (R7.11).
+
+        Called immediately before the offset commit, which is what keeps the invariant
+        **changelog >= committed offset**: a rebuild may be ahead of the offset, never
+        behind it. The reverse order would let a crash leave the offset past a fold that
+        no rebuild can reproduce.
+
+        Raises:
+            StateStoreUnavailable: If anything is still unsent when the timeout expires.
+        """
+        remaining = self._producer.flush(timeout)
+        if remaining:
+            raise StateStoreUnavailable(
+                f"{remaining} changelog record(s) unacknowledged after {timeout:.0f}s — "
+                f"refusing to commit past state that cannot be rebuilt"
+            )
+
+    # -- rebuilding -----------------------------------------------------------------
+
+    def restore(self, partitions: Iterable[int]) -> None:
+        """Rebuild each partition's store from its changelog partition (R7.7, R7.8).
+
+        Blocking, inside the assignment callback, and that is the design: the loop must
+        not process a message for a partition whose memory is still being read back.
+
+        Raises:
+            StateStoreUnavailable: If a partition cannot be replayed to its watermark.
+                Deliberately fatal — folding against a half-built store would report
+                sequence gaps that never happened, which is the exact bug this whole
+                line of features exists to remove.
+        """
+        for partition in sorted(set(partitions)):
+            self._restore_one(partition)
+
+    def _restore_one(self, partition: int) -> None:
+        """Replay one changelog partition into one store, and log what it cost."""
+        started = time.monotonic()
+        reader = self._changelog_reader()
+        target = TopicPartition(self._topic, partition)
+        try:
+            _low, high = reader.get_watermark_offsets(
+                target, timeout=_WATERMARK_TIMEOUT_SECONDS, cached=False
+            )
+        except KafkaException as exc:
+            reader.close()
+            raise StateStoreUnavailable(
+                f"cannot read the end of {self._topic}-{partition}: {exc}"
+            ) from exc
+
+        start = self._start_offset(partition, low=_low)
+        records, keys = 0, 0
+        try:
+            if start < high:
+                # assign(), never subscribe(): a subscription would join a SECOND group
+                # and rebalance it — during a rebalance (007 D7).
+                reader.assign([TopicPartition(self._topic, partition, start)])
+                records, keys = self._drain(reader, partition, start=start, high=high)
+        finally:
+            reader.close()
+
+        self._position[partition] = high
+        # WARNING, alongside REBALANCE / VIOLATION / TOMBSTONE, because `records` versus
+        # `keys` is this entire feature stated as two numbers (R7.7).
+        logger.warning(
+            "[%s] RESTORED partition=%d records=%d keys=%d from=%d to=%d mode=%s ms=%d",
+            self._group_id,
+            partition,
+            records,
+            keys,
+            start,
+            high,
+            self._settings.state_rebuild,
+            int((time.monotonic() - started) * 1000),
+        )
+
+    def _drain(
+        self, reader: Consumer, partition: int, *, start: int, high: int
+    ) -> tuple[int, int]:
+        """Read one assigned partition to its watermark, applying every record.
+
+        Returns:
+            The number of records read, and the number of keys **left live** by them.
+            A key whose last record was a tombstone is not counted: it was replayed, but
+            it was not restored, and R7.7 asks for the second number. The gap between the
+            two is the compaction ratio — the whole point of the changelog being a table.
+
+        Raises:
+            StateStoreUnavailable: If the replay stalls short of the watermark.
+        """
+        store = self._store_for(partition)
+        records, live = 0, set()
+        next_offset = start
+        while next_offset < high:
+            message = reader.poll(_RESTORE_STALL_SECONDS)
+            if message is None:
+                raise StateStoreUnavailable(
+                    f"restoring {self._topic}-{partition} stalled at offset "
+                    f"{next_offset} of {high}"
+                )
+            error = message.error()
+            if error is not None:
+                if error.code() == KafkaError._PARTITION_EOF:  # noqa: SLF001
+                    continue
+                raise StateStoreUnavailable(
+                    f"restoring {self._topic}-{partition}: {error}"
+                )
+
+            next_offset = message.offset() + 1
+            records += 1
+            order_id = _key_of(message)
+            try:
+                if message.value() is None:
+                    # A tombstone on the changelog: the delete, replayed. Without this
+                    # branch every rebuild would resurrect every deleted order.
+                    if store.get(order_id) is not None:
+                        del store[order_id]
+                    live.discard(order_id)
+                else:
+                    store[order_id] = bytes(message.value())
+                    live.add(order_id)
+            except StateStoreUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
+                raise StateStoreUnavailable(
+                    f"restoring {self._topic}-{partition} at offset "
+                    f"{message.offset()}: {exc}"
+                ) from exc
+
+        return records, len(live)
+
+    def _start_offset(self, partition: int, *, low: int) -> int:
+        """Return the changelog offset a rebuild begins at (R7.9).
+
+        Under ``full`` the store is destroyed and replayed from the beginning of the
+        partition, so the cost is visible on every assignment. Under ``checkpoint`` the
+        existing store is kept and only the delta is applied.
+        """
+        if self._settings.state_rebuild is StateRebuild.CHECKPOINT:
+            checkpoint = self._read_checkpoint(partition)
+            if checkpoint is not None:
+                return max(checkpoint, low)
+        self._destroy(partition)
+        return low
+
+    def _changelog_reader(self) -> Consumer:
+        """Build the assign-only consumer a rebuild reads through (R7.8).
+
+        ``group.id`` is required to construct a ``Consumer`` at all, so it is set to a
+        throwaway that is never joined: the reader only ever calls ``assign()``, which
+        performs no group join, commits nothing, and leaves nothing in the coordinator.
+        """
+        return Consumer(
+            {
+                "bootstrap.servers": self._settings.kafka_bootstrap_servers,
+                "group.id": f"{self._group_id}-restore-{uuid.uuid4().hex[:8]}",
+                "enable.auto.commit": False,
+                "auto.offset.reset": "earliest",
+                "enable.partition.eof": True,
+            }
+        )
+
+    # -- lifecycle ------------------------------------------------------------------
 
     def forget(self, partitions: Iterable[int]) -> None:
-        """Drop the cache for these partitions, and issue no ``DELETE`` (R3.9).
+        """Release exactly these partitions, destroying nothing (R3.9, R7.10).
 
-        This one line is the whole difference between 002 and 003 at a rebalance: the
-        same callback fires and the same partitions are dropped, but the record survives
-        because the record was never in the process.
+        Flush first, then checkpoint, then close. The directory and every changelog
+        record stay where they are, so the member assigned this partition next can
+        rebuild what this one folded — which is the entire difference between 002's
+        rebalance and this one.
         """
-        for partition in set(partitions):
-            self._cache.pop(partition, None)
+        wanted = sorted(set(partitions))
+        if not wanted:
+            return
+        # Before the checkpoints: a checkpoint claims the changelog holds everything up
+        # to that offset, and an unflushed produce would make that a lie.
+        self._producer.flush(30.0)
+        for partition in wanted:
+            store = self._stores.pop(partition, None)
+            if store is None:
+                continue
+            self._write_checkpoint(partition)
+            store.close()
 
     def held(self) -> list[int]:
-        """Return the partitions currently cached."""
-        return sorted(self._cache)
+        """Return the partitions this instance currently holds a store for."""
+        return sorted(self._stores)
 
     def close(self) -> None:
-        """Release the connection."""
-        self._conn.close()
+        """Flush, checkpoint and close every open partition."""
+        self.forget(list(self._stores))
+
+    # -- internals ------------------------------------------------------------------
+
+    def _store_for(self, partition: int) -> Rdict:
+        """Open, or return, the store for one partition.
+
+        Raises:
+            StateStoreUnavailable: If the directory cannot be opened — most often
+                because another process already holds its lock, which is the constraint
+                R7.12 exists to state.
+        """
+        store = self._stores.get(partition)
+        if store is not None:
+            return store
+        path = self._path_for(partition)
+        try:
+            store = Rdict(str(path))
+        except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
+            raise StateStoreUnavailable(
+                f"state backend 'local' cannot open {path}: {exc}"
+            ) from exc
+        self._stores[partition] = store
+        return store
+
+    def _read(self, partition: int, order_id: str) -> _Record | None:
+        """Return one stored record, or ``None``."""
+        store = self._store_for(partition)
+        try:
+            raw = store.get(order_id)
+        except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
+            raise StateStoreUnavailable(f"reading {order_id}: {exc}") from exc
+        return None if raw is None else _Record.decode(order_id, bytes(raw))
+
+    def _write(self, partition: int, order_id: str, value: bytes) -> None:
+        """Write one value locally and publish the same bytes to the changelog."""
+        store = self._store_for(partition)
+        try:
+            store[order_id] = value
+        except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
+            raise StateStoreUnavailable(f"writing {order_id}: {exc}") from exc
+        self._publish(partition, order_id, value)
+
+    def _publish(self, partition: int, order_id: str, value: bytes | None) -> None:
+        """Enqueue one changelog record, which may be a tombstone.
+
+        Raises:
+            StateStoreUnavailable: If it cannot be enqueued even after draining.
+        """
+
+        def on_delivery(err: object, msg: Message) -> None:
+            if err is not None:
+                # Not raised here — this runs on the producer's thread. flush() is what
+                # turns an unacknowledged changelog into a refusal to commit.
+                logger.error(
+                    "[%s] CHANGELOG_DELIVERY_FAILED order_id=%s reason=%s",
+                    self._group_id,
+                    order_id,
+                    err,
+                )
+                return
+            self._position[msg.partition()] = max(
+                self._position.get(msg.partition(), 0), msg.offset() + 1
+            )
+
+        try:
+            self._producer.produce(
+                topic=self._topic,
+                key=order_id.encode("utf-8"),
+                value=value,
+                on_delivery=on_delivery,
+            )
+        except BufferError:
+            # The local queue is full: serve delivery reports and try once more, rather
+            # than dropping a record that makes the local store unrecoverable.
+            self._producer.flush(30.0)
+            try:
+                self._producer.produce(
+                    topic=self._topic,
+                    key=order_id.encode("utf-8"),
+                    value=value,
+                    on_delivery=on_delivery,
+                )
+            except (BufferError, KafkaException) as exc:
+                raise StateStoreUnavailable(
+                    f"changelog for {order_id} could not be enqueued: {exc}"
+                ) from exc
+        except KafkaException as exc:
+            raise StateStoreUnavailable(
+                f"changelog for {order_id} could not be enqueued: {exc}"
+            ) from exc
+
+        # Serves delivery callbacks without blocking, so _position advances as the
+        # broker acknowledges rather than only at the next flush.
+        self._producer.poll(0)
+
+    def _path_for(self, partition: int) -> Path:
+        """Return the directory holding one partition's store."""
+        return self._root / str(partition)
+
+    def _checkpoint_path(self, partition: int) -> Path:
+        """Return the file holding one partition's restore mark (007 D8).
+
+        Beside the store rather than inside it: a store that will not open would
+        otherwise take its own recovery marker down with it.
+        """
+        return self._root / f"{partition}.ckpt"
+
+    def _read_checkpoint(self, partition: int) -> int | None:
+        """Return the offset this partition was last brought up to, if it is recorded."""
+        path = self._checkpoint_path(partition)
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            # Absent or unreadable is not an error — it means "replay from the start",
+            # which is always correct, only slower.
+            return None
+
+    def _write_checkpoint(self, partition: int) -> None:
+        """Record how far this partition's store has been brought up to."""
+        position = self._position.get(partition)
+        if position is None:
+            return
+        try:
+            self._checkpoint_path(partition).write_text(f"{position}\n")
+        except OSError as exc:
+            # Never fatal: a lost checkpoint costs a full replay, which is the default
+            # anyway. Losing the partition over it would be the worse trade.
+            logger.warning(
+                "[%s] could not write checkpoint for partition %d: %s",
+                self._group_id,
+                partition,
+                exc,
+            )
+
+    def _destroy(self, partition: int) -> None:
+        """Close and erase one partition's store, so a full replay starts empty."""
+        store = self._stores.pop(partition, None)
+        if store is not None:
+            store.close()
+        path = self._path_for(partition)
+        if not path.exists():
+            return
+        try:
+            Rdict.destroy(str(path))
+        except Exception as exc:  # noqa: BLE001 — the engine raises bare Exception
+            raise StateStoreUnavailable(
+                f"cannot reset {path} for a full rebuild: {exc}"
+            ) from exc
+
+
+def _key_of(message: Message) -> str:
+    """Return a changelog record's key as text.
+
+    Raises:
+        StateStoreUnavailable: If the key is null. A compacted topic rejects null keys at
+            the broker, so this means the topic is not the one this store thinks it is.
+    """
+    key = message.key()
+    if key is None:
+        raise StateStoreUnavailable(
+            f"null key on {message.topic()}-{message.partition()} at offset "
+            f"{message.offset()} — is that topic compacted?"
+        )
+    return bytes(key).decode("utf-8")

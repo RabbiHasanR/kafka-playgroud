@@ -9,12 +9,18 @@ three read every message and stopping one cannot affect the others.
 
 Offsets commit after the handler returns (R1.32), so delivery is at-least-once. Where
 the fold *lives* is 003's subject: a :class:`~order_service.consumer.state.StateStore` is
-injected, so the same loop runs against 002's in-process dict or against Postgres, and
-the difference is one environment variable (003 D2, D8).
+injected, so the same loop runs against 002's in-process dict or against the durable
+backend, and the difference is one environment variable (003 D2, D8).
 
-With the durable store the two writes go to two systems — the fold to Postgres, the
-offset to Kafka — and nothing covers both. The order between them is deliberate and
-switchable (003 D4), and the window between them can be opened on purpose (003 D5).
+With the durable store there are still two writes and nothing covering both — but from
+007 both are Kafka operations: the fold goes to a compacted changelog topic, the offset to
+``__consumer_offsets``. The order between them is deliberate and switchable (003 D4), the
+window between them can be opened on purpose (003 D5), and closing it with one transaction
+is 008.
+
+From 007 the loop also **rebuilds before it consumes**. ``_on_assign`` blocks while the
+store replays the changelog partitions it was just given, because a store rebuilt after
+messages were processed is a store that missed them (007 D6).
 
 From 006 the loop reads **two** topics, and only one of them folds. ``order-lifecycle``
 is the event log and remains the fold's sole source. ``order-snapshot`` is compacted and
@@ -46,7 +52,14 @@ from order_service.config import (
     StateWriteOrder,
 )
 from order_service.consumer import failures
-from order_service.consumer.dlq import FailurePublishFailed, FailureRouter, Origin
+from order_service.consumer.dlq import (
+    HDR_ATTEMPT,
+    HDR_RETRY_TARGET,
+    FailurePublishFailed,
+    FailureRouter,
+    Origin,
+    decode_headers,
+)
 from order_service.consumer.errors import NonRetryableError, classify
 from order_service.consumer.state import OrderFold, StateStore, StateStoreUnavailable
 from order_service.events import (
@@ -226,6 +239,26 @@ def key_of(message: Message) -> str:
         return key.decode("utf-8")
     except UnicodeDecodeError:
         return "<undecodable-key>"
+
+
+def _attempt_of(headers: Mapping[str, str]) -> int:
+    """Return the attempt a message arrives on, defaulting to the inline first one.
+
+    Only a message the retry worker put back carries ``x-attempt`` (R7.13). Anything
+    else — a fresh event, a hand-produced one, a replay — is attempt 1, which is also
+    what a malformed header falls back to: spending an extra attempt is a smaller
+    mistake than refusing to process the message at all.
+
+    Args:
+        headers: The message's decoded headers.
+
+    Returns:
+        The 1-based attempt number this delivery is spending.
+    """
+    try:
+        return max(1, int(headers[HDR_ATTEMPT]))
+    except (KeyError, ValueError):
+        return 1
 
 
 def apply_event(
@@ -415,8 +448,26 @@ class ServiceConsumer:
     # WARNING, not INFO: R2.9 wants these to stand out from per-record lines.
 
     def _on_assign(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
-        """Log partitions gained. Does not assign — the client does (D5)."""
+        """Log partitions gained, then rebuild their state before consuming (R7.7).
+
+        Does not assign — the client does (002 D5).
+
+        **The partition numbers are deduplicated first.** The subscription spans
+        ``order-lifecycle`` and ``order-snapshot``, so this callback receives up to two
+        ``TopicPartition``s per number, while the store is keyed by the number alone
+        (006 D8). Restoring per topic-partition would replay every changelog twice.
+
+        Blocking here is the design (007 D6). The cost is real and is the reason
+        ``STATE_REBUILD=checkpoint`` exists: a rebuild longer than
+        ``max.poll.interval.ms`` gets this member evicted mid-restore.
+
+        Raises:
+            StateStoreUnavailable: If a partition cannot be rebuilt. Deliberately not
+                caught — consuming against a half-built store would report sequence gaps
+                that never happened (R3.22).
+        """
         self._log_membership("ASSIGNED", partitions)
+        self._store.restore({tp.partition for tp in partitions})
 
     def _on_revoke(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
         """Log partitions given up and release exactly their state (R2.14, R3.9)."""
@@ -450,17 +501,18 @@ class ServiceConsumer:
         )
 
     def _forget(self, partitions: list[TopicPartition]) -> None:
-        """Release this member's in-process state for exactly these partitions.
+        """Release this member's state for exactly these partitions.
 
-        **What this means now depends on the backend, and that is the whole feature.**
+        **What this means depends on the backend, and that is the whole feature.**
 
         On the memory backend it is 002 unchanged: the folds are gone, so whoever
         receives these partitions next starts with no memory of their orders and reports
         R2.15's sequence-gap violations.
 
-        On the durable backend the same call drops a *cache* and issues no ``DELETE``
-        (R3.9). The record survives because the record was never in the process, so the
-        member that inherits the partition reads it and reports nothing (R3.8).
+        On the local backend the same call flushes the changelog, writes each partition's
+        checkpoint and closes its store, destroying nothing (R3.9, R7.10). The record
+        survives because it is on a compacted topic, so the member that inherits the
+        partition replays it and reports nothing (R3.8).
         """
         self._store.forget(tp.partition for tp in partitions)
 
@@ -528,10 +580,31 @@ class ServiceConsumer:
             self._commit(message)
             return
 
+        # 007 R7.13 — a message the retry worker put back carries the one service it is
+        # for. The source topic fans out to all three groups, and the other two already
+        # handled this message successfully; without this branch they would run their
+        # handlers a second time. Same shape as the snapshot branch above: log, commit,
+        # move on.
+        headers = decode_headers(message)
+        attempt = _attempt_of(headers)
+        target = headers.get(HDR_RETRY_TARGET)
+        if target is not None and target != self._spec.name:
+            logger.debug(
+                "[%s/%s] retry for %s, not ours partition=%d offset=%d key=%s",
+                self._spec.name,
+                self._instance,
+                target,
+                partition,
+                message.offset(),
+                key_of(message),
+            )
+            self._commit(message)
+            return
+
         try:
             event = self._decode(message)
         except NonRetryableError as exc:
-            self._route_failure(message, exc, event=None)
+            self._route_failure(message, exc, event=None, attempt=attempt)
             return
 
         # R1.42, R2.8 — service and instance first, so streams stay greppable.
@@ -566,9 +639,13 @@ class ServiceConsumer:
             )
 
         # 005 — attempt 1, spent inline. A handler that succeeds here never touches the
-        # retry topic, which is why RETRY_MAX_ATTEMPTS counts this one (D8).
+        # retry topic, which is why RETRY_MAX_ATTEMPTS counts this one (005 D8).
+        #
+        # 007 R7.13 — unless the retry worker put this message back, in which case
+        # `attempt` above came off the header. That is what stops a republished message
+        # restarting its budget and ping-ponging between the two topics forever.
         try:
-            failures.maybe_fail(self._settings, event, attempt=1)
+            failures.maybe_fail(self._settings, event, attempt=attempt)
             handler = self._spec.handlers.get(event.event_type)
             if handler is not None:
                 handler(event)
@@ -577,7 +654,7 @@ class ServiceConsumer:
             # must not be filed as one, or a database outage would fill the DLQ.
             raise
         except Exception as exc:  # noqa: BLE001 — classify() decides, not the type here
-            self._route_failure(message, exc, event=event)
+            self._route_failure(message, exc, event=event, attempt=attempt)
             return
 
         # R2.23 — the eviction lever (002 D9): sleep here and the commit below fails.
@@ -620,7 +697,12 @@ class ServiceConsumer:
         self._commit(message)
 
     def _route_failure(
-        self, message: Message, exc: BaseException, *, event: LifecycleEvent | None
+        self,
+        message: Message,
+        exc: BaseException,
+        *,
+        event: LifecycleEvent | None,
+        attempt: int = 1,
     ) -> None:
         """Send a failed message to the retry or dead-letter topic, then commit.
 
@@ -637,25 +719,31 @@ class ServiceConsumer:
             message: The message that failed.
             exc: What went wrong.
             event: The decoded event, or ``None`` when it was the decode that failed.
+            attempt: The attempt just spent. ``1`` for a message read from the source
+                topic normally; higher for one the retry worker put back, whose header
+                carried the count forward (R7.13). The budget is measured against this,
+                so a republished attempt 3 of 3 goes to the dead-letter topic rather than
+                being scheduled a fourth time.
         """
         order_id = event.order_id if event is not None else key_of(message)
         origin = Origin.from_message(message)
         kind = classify(exc)
-        # Attempt 1 was spent inline whatever happens next.
+        # Whatever happens next, `attempt` has now been spent.
         retryable = kind is not NonRetryableError
-        budget_left = retryable and self._settings.retry_max_attempts > 1
+        budget_left = retryable and self._settings.retry_max_attempts > attempt
 
         try:
             if not budget_left:
                 marker = "RETRY_EXHAUSTED" if retryable else "POISON_MESSAGE"
                 logger.warning(
-                    "[%s/%s] %s order_id=%s partition=%s offset=%s attempts=1 error=%s: %s",
+                    "[%s/%s] %s order_id=%s partition=%s offset=%s attempts=%d error=%s: %s",
                     self._spec.name,
                     self._instance,
                     marker,
                     order_id,
                     origin.partition,
                     origin.offset,
+                    attempt,
                     type(exc).__name__,
                     exc,
                 )
@@ -664,7 +752,7 @@ class ServiceConsumer:
                     origin=origin,
                     service=self._spec.name,
                     group_id=self._group_id,
-                    attempts_made=1,
+                    attempts_made=attempt,
                     error=exc,
                 )
                 logger.warning(
@@ -680,14 +768,16 @@ class ServiceConsumer:
                     origin=origin,
                     service=self._spec.name,
                     group_id=self._group_id,
-                    attempt=2,
+                    attempt=attempt + 1,
                     error=exc,
                 )
                 logger.warning(
-                    "[%s/%s] RETRY_SCHEDULED order_id=%s attempt=2 of %d due=%s error=%s: %s",
+                    "[%s/%s] RETRY_SCHEDULED order_id=%s attempt=%d of %d due=%s "
+                    "error=%s: %s",
                     self._spec.name,
                     self._instance,
                     order_id,
+                    attempt + 1,
                     self._settings.retry_max_attempts,
                     due_at.isoformat(),
                     type(exc).__name__,
@@ -747,6 +837,10 @@ class ServiceConsumer:
                             fold is **permanently** missing it, silently
         ==================  ==========================================================
 
+        Note that ``offset_first`` deliberately does **not** flush before committing.
+        That is the point of the lever: it commits past a fold the changelog may never
+        receive, which is precisely the ordering R7.11 forbids.
+
         The default is not a preference (R3.5). The lever exists so the other outcome
         can be watched rather than asserted (R3.16, R3.18).
 
@@ -761,6 +855,12 @@ class ServiceConsumer:
             return
 
         self._save_fold(event, fold, partition)
+        # R7.11 — the fold is only durable once the broker has it, so the flush is part
+        # of the state write rather than an optimisation after it. This is what keeps the
+        # changelog at or ahead of the committed offset: a rebuild may know more than the
+        # offset says, never less. The crash lever fires AFTER it, so `state_write` still
+        # means "state is durable, offset is not" exactly as 003 recorded.
+        self._store.flush()
         self._crash_if_configured(StateCrashPoint.STATE_WRITE, event)
         # R1.32 — only now, after the handler has run and the state is durable.
         self._commit(message)
