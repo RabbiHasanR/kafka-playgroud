@@ -25,6 +25,15 @@ the handler and folds through the ordinary path. Everything downstream of that (
 failure, the attempt budget, the dead-letter route) is the consumer's existing logic, not
 a second copy here.
 
+**What it did not get at 008.** The worker reads ``read_committed`` like every other
+consumer, so it never schedules a retry for a message whose transaction aborted. Its own
+cycle is untouched: it consumes, republishes, and commits, which is the same two-operation
+shape the service consumers had their transaction wrap. A crash between the republish and
+the commit still redelivers, and the message is scheduled twice. That is deliberate — a
+second transactional producer with its own identity lifecycle would add surface without
+showing a mechanism 008 has not already shown — and it is the open gap 008 names rather
+than closes.
+
 **Known gap (D14).** One topic carrying per-message delays can invert: a message due in
 120s sits at the head of a partition and holds up messages behind it that are due in 30s.
 Tiered delay topics are the fix and are deliberately not built, so the stall is watchable.
@@ -57,6 +66,7 @@ from order_service.consumer.dlq import (
 )
 from order_service.consumer.errors import NonRetryableError
 from order_service.consumer.main import SERVICE_REGISTRY
+from order_service.consumer.transactions import build_producer
 from order_service.consumer.runtime import (
     ConsumerConfigError,
     ServiceSpec,
@@ -412,7 +422,15 @@ def main() -> None:
 
     # No state stores here since 007. The worker holds no partition, so it may write no
     # fold (R7.12); it republishes and the owning consumer does both.
-    router = FailureRouter(settings)
+    #
+    # 008 D1 — a producer of its own, not a transactional one. This loop's own
+    # republish-and-commit is still two operations; see the module docstring.
+    producer = build_producer(
+        settings,
+        group_id=settings.consumer_group_id or RETRY_WORKER_GROUP,
+        instance=settings.instance_label,
+    )
+    router = FailureRouter(settings, producer)
     try:
         worker = RetryWorker(settings, specs, router)
     except ConsumerConfigError as exc:
@@ -434,6 +452,9 @@ def main() -> None:
         sys.exit(1)
     finally:
         router.close()
+        remaining = producer.flush(10.0)
+        if remaining:
+            logger.warning("[retry-worker] flush left %d message(s) unsent", remaining)
 
 
 if __name__ == "__main__":

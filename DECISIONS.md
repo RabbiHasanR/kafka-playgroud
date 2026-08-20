@@ -490,3 +490,47 @@ restore co-partitioning — it works, but the rebuild then reads all three group
 discards two-thirds, and the explicit partition is a footgun the moment anyone forgets it.
 Reusing `order-snapshot`, per X12 — it carries no per-group `last_sequence` and no
 `handled_count`, so bootstrapping from it merges three memories R3.2 requires to stay separate.
+
+---
+
+## X14 — Exactly-once uses v2: one producer per instance, fenced by group metadata
+
+**Date:** 2026-08-20 **Status:** accepted **Specs:** 008
+
+**Context.** 008 puts the changelog write and the offset commit into one transaction — the
+thing 003's Postgres fold made impossible (X4) and 007's changelog made possible (X5). Kafka
+offers two ways to hold the transactional identity that makes it safe under rebalancing.
+
+**v1** gives each *partition* its own `transactional.id`, so a producer is created when a
+partition is assigned and destroyed when it is revoked. **v2** (KIP-447, broker 2.5+) keeps
+one producer per *instance* and fences through the consumer group's generation, carried by
+`consumer_group_metadata()` into `send_offsets_to_transaction`.
+
+**Decision.** v2. The identity is `<group_id>-<CONSUMER_INSTANCE_ID>`, held for the life of
+the process.
+
+**Consequences.** v1 would put producer construction inside `_on_assign`, which 007 D6
+already made **blocking** — it rebuilds every assigned partition's state store before
+consuming. A rebalance would then pay for a restore *and* a set of `init_transactions()`
+round trips on the one callback that is already the slowest, and R7.7's note about a rebuild
+outlasting `max.poll.interval.ms` would get materially worse.
+
+The cost is that `CONSUMER_INSTANCE_ID` stops being cosmetic. It has been a log field since
+002; it is now half the transactional identity, and the identity must be **stable across
+restarts** or fencing is decorative — a restarted member carrying a fresh identity cannot
+fence the zombie it replaced, which is the entire purpose of having one. Two members sharing
+a value fence each other in a loop, each bumping the epoch the other just took. R8.5 makes
+that exit loudly rather than spin, and `docker-compose.yml` now sets a distinct value on
+every consumer.
+
+A second consequence reaches into two components. Every write inside one transaction must
+come from one producer instance, but `LocalStateStore` (007) and `FailureRouter` (005) each
+built their own. Both now take one, built in `main.py`. The sharing is unconditional rather
+than switched on with the guarantee, so there is one wiring shape rather than two and the
+default path exercises the same one the transactional path does.
+
+**Rejected.** *v1* — for the rebalance cost above, and because its per-partition identity is
+precisely what KIP-447 was written to remove. *A random identity per process start* — it
+starts cleanly and fences nothing, which is the worst available failure in a repository whose
+output is observations. *An identity persisted to `STATE_DIR`* — survives a restart but not a
+lost volume, which is exactly when a zombie is most likely to exist.

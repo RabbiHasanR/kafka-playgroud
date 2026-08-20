@@ -181,6 +181,34 @@ x-state-env: &state-env
   STATE_CHANGELOG_PREFIX: ${STATE_CHANGELOG_PREFIX:-order-fold}
   STATE_REBUILD: ${STATE_REBUILD:-full}
 
+# --- spec 008: idempotence, transactions, exactly-once --------------------------
+# PROCESSING_GUARANTEE defaults to at_least_once here as well as in config.py, so a
+# plain `up -d` reproduces 007 exactly. The guarantee is the thing being demonstrated,
+# and a demonstration you cannot turn off has no control (R8.2, R8.14):
+#   PROCESSING_GUARANTEE=exactly_once docker compose up -d
+#
+# PRODUCER_IDEMPOTENCE defaults ON and applies to every producer in the system — the
+# order service's, the failure router's, and the changelog's. Turning it off is what
+# 001-007 ran as, and is the only way to reach the reordering it prevents.
+#
+# CONSUMER_ISOLATION_LEVEL is passed through so a console consumer can be pointed at the
+# changelog with read_uncommitted and SEE the records an aborted transaction left behind.
+# Do not set it to read_uncommitted on the consumers themselves under exactly_once: a
+# rebuild would then replay aborted folds, which is the corruption the guarantee is
+# bought to prevent (R8.10).
+#
+# TRANSACTION_COMMIT_INTERVAL_MESSAGES=1 is the per-message setting the transaction_open
+# crash point wants. The default of 100 is what the throughput comparison runs against.
+#
+# STATE_REBUILD=checkpoint is REFUSED under exactly_once and the process exits 2 (R8.12).
+x-guarantee-env: &guarantee-env
+  PROCESSING_GUARANTEE: ${PROCESSING_GUARANTEE:-at_least_once}
+  PRODUCER_IDEMPOTENCE: ${PRODUCER_IDEMPOTENCE:-true}
+  CONSUMER_ISOLATION_LEVEL: ${CONSUMER_ISOLATION_LEVEL:-read_committed}
+  TRANSACTION_COMMIT_INTERVAL_MESSAGES: ${TRANSACTION_COMMIT_INTERVAL_MESSAGES:-100}
+  TRANSACTION_COMMIT_INTERVAL_MS: ${TRANSACTION_COMMIT_INTERVAL_MS:-200}
+  TRANSACTION_TIMEOUT_MS: ${TRANSACTION_TIMEOUT_MS:-60000}
+
 services:
   # --- spec 004: the three-broker cluster ---------------------------------
   # Node ids 1/2/3; hostnames kafka, kafka-2, kafka-3 (asymmetric on purpose, D2).
@@ -273,6 +301,9 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       ORDER_SERVICE_HOST: 0.0.0.0
       ORDER_SERVICE_PORT: 8010
+      # 008 R8.1 — idempotence only. There is no consumed offset here to fold into a
+      # transaction, so this producer never becomes transactional.
+      PRODUCER_IDEMPOTENCE: ${PRODUCER_IDEMPOTENCE:-true}
     depends_on:
       kafka:
         condition: service_healthy
@@ -295,7 +326,9 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       SERVICE_NAME: inventory
       CONSUMER_GROUP_ID: inventory-service
-      <<: [*topics-env, *state-env, *failure-env]
+      # 008 D3 — half the transactional.id, so it must be stable and unique per member.
+      CONSUMER_INSTANCE_ID: inventory-1
+      <<: [*topics-env, *state-env, *failure-env, *guarantee-env]
     depends_on: *consumer-deps
 
   # --- spec 002: notification scales out ----------------------------------
@@ -317,7 +350,7 @@ services:
     volumes:
       - notification1-state:${STATE_DIR:-/var/lib/order-state}
     environment:
-      <<: [*topics-env, *notification-env, *state-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env, *guarantee-env]
       CONSUMER_INSTANCE_ID: notification-1
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-1}
 
@@ -328,7 +361,7 @@ services:
       - notification2-state:${STATE_DIR:-/var/lib/order-state}
     profiles: ["scale-out"]
     environment:
-      <<: [*topics-env, *notification-env, *state-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env, *guarantee-env]
       CONSUMER_INSTANCE_ID: notification-2
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-2}
 
@@ -339,7 +372,7 @@ services:
       - notification3-state:${STATE_DIR:-/var/lib/order-state}
     profiles: ["scale-out"]
     environment:
-      <<: [*topics-env, *notification-env, *state-env, *failure-env]
+      <<: [*topics-env, *notification-env, *state-env, *failure-env, *guarantee-env]
       CONSUMER_INSTANCE_ID: notification-3
       CONSUMER_INSTANCE_ID_STATIC: ${STATIC_MEMBERSHIP:+notification-3}
 
@@ -353,7 +386,9 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       SERVICE_NAME: analytics
       CONSUMER_GROUP_ID: analytics-service
-      <<: [*topics-env, *state-env, *failure-env]
+      # 008 D3 — half the transactional.id, so it must be stable and unique per member.
+      CONSUMER_INSTANCE_ID: analytics-1
+      <<: [*topics-env, *state-env, *failure-env, *guarantee-env]
     depends_on: *consumer-deps
 
   # --- spec 005: the process that does the waiting ------------------------
@@ -378,7 +413,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       CONSUMER_INSTANCE_ID: retry-worker
-      <<: [*topics-env, *state-env, *failure-env]
+      <<: [*topics-env, *state-env, *failure-env, *guarantee-env]
     depends_on: *consumer-deps
 
 volumes:

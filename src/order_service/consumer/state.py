@@ -34,14 +34,22 @@ the three services fold the same order at their own pace, so one topic keyed by
 ``order_id`` would have them overwrite one another. The group therefore goes in the topic
 name; putting it in the key would put it in the partition hash and break co-partitioning.
 
-The offset still commits to Kafka and the fold now goes to a Kafka topic, so there are
-still two writes and nothing covering both — but both are now Kafka operations, which is
-what lets one transaction cover them at 008. ``handled_count`` still counts what the
-sequence guard absorbs, and is still the residue 008 drives to zero.
+From 008 those two writes can be one. Both are Kafka operations — which is what 007's
+move out of Postgres bought — so under ``PROCESSING_GUARANTEE=exactly_once`` the changelog
+record and the offset go into a single transaction, and the producer that carries them is
+no longer built here: it is the process's one producer, shared with the failure router,
+because every write inside one transaction must come from one instance (R8.4).
+
+What the transaction does **not** cover is the RocksDB write, which is a disk operation and
+cannot be rolled back. So an abort has a repair rather than a rollback: :meth:`discard`
+deletes the affected partitions and :meth:`restore` replays them from the changelog's
+committed records. That is why the restore reader reads ``read_committed``, and why
+``STATE_REBUILD=checkpoint`` is refused under the guarantee (R8.11, R8.12).
 """
 
 import json
 import logging
+import shutil
 import time
 import uuid
 from collections.abc import Iterable
@@ -60,6 +68,7 @@ from confluent_kafka import (
 from rocksdict import Rdict
 
 from order_service.config import Settings, StateRebuild
+from order_service.consumer.transactions import isolation_level
 from order_service.events import OrderState
 
 logger = logging.getLogger(__name__)
@@ -155,6 +164,16 @@ class StateStore(Protocol):
         """Release in-process state for exactly these partitions."""
         ...
 
+    def discard(self, partitions: Iterable[int]) -> None:
+        """Destroy state for these partitions, so the next restore rebuilds it (R8.11).
+
+        Unlike :meth:`forget`, which releases a store believing it to be correct, this
+        throws the contents away. An aborted transaction leaves the store holding folds
+        the changelog never received, and no transaction can roll back a local disk
+        write — so the only repair is to delete and replay.
+        """
+        ...
+
     def held(self) -> list[int]:
         """Return the partitions this store currently holds state for, for logging."""
         ...
@@ -231,6 +250,15 @@ class MemoryStateStore:
             self._folds.pop(partition, None)
             for key in [k for k in self._handled if k[0] == partition]:
                 del self._handled[key]
+
+    def discard(self, partitions: Iterable[int]) -> None:
+        """Drop these partitions' folds (R8.11).
+
+        Identical to :meth:`forget` on this backend, because there is nothing on disk to
+        delete and nothing to replay afterwards — this store's restore is a no-op. Kept
+        distinct so the Protocol has one meaning for both backends.
+        """
+        self.forget(partitions)
 
     def held(self) -> list[int]:
         """Return the partitions holding folds."""
@@ -310,14 +338,19 @@ class LocalStateStore:
     something already in memory-mapped local files.
     """
 
-    def __init__(self, settings: Settings, group_id: str) -> None:
-        """Open the store root and the changelog producer.
+    def __init__(self, settings: Settings, group_id: str, producer: Producer) -> None:
+        """Open the store root and take the producer the changelog is written through.
 
         Args:
             settings: Resolved environment settings.
             group_id: The consumer group whose memory this is. It names both the
                 directory and the changelog topic, so the three services' memories stay
                 independent exactly as their offsets are (R3.2).
+            producer: The process's one producer, built and owned by ``main.py`` (R8.4,
+                008 D1). This class built its own until 008. It cannot any more: under a
+                transaction the changelog write and the offset have to be covered
+                together, and every write inside one transaction must come from one
+                producer instance — which the failure router also writes through.
 
         Raises:
             StateStoreUnavailable: If the state directory cannot be created.
@@ -338,22 +371,9 @@ class LocalStateStore:
         #: restore, advanced by delivery reports, written to the checkpoint on release.
         self._position: dict[int, int] = {}
 
-        self._producer = Producer(
-            {
-                "bootstrap.servers": settings.kafka_bootstrap_servers,
-                # Hardcoded rather than following PRODUCER_ACKS (004 D5), for the same
-                # reason the failure router hardcodes it: this is the record that makes
-                # local disk recoverable, and losing it silently is the failure the
-                # whole backend exists to prevent.
-                "acks": "all",
-                # The SAME partitioner as the order producer. Equal partition counts plus
-                # one key and one partitioner are what put order X's fold and order X's
-                # events on the same partition NUMBER, which is what makes restoring one
-                # partition from one changelog partition correct (006 D8, 007 D1).
-                "partitioner": "consistent_random",
-                "client.id": f"{group_id}-changelog",
-            }
-        )
+        # 008 D1 — not built here any more. `acks=all` and the shared partitioner moved
+        # to `transactions.build_producer` unchanged; what changed is who owns it.
+        self._producer = producer
 
     @property
     def group_id(self) -> str:
@@ -646,6 +666,11 @@ class LocalStateStore:
         ``group.id`` is required to construct a ``Consumer`` at all, so it is set to a
         throwaway that is never joined: the reader only ever calls ``assign()``, which
         performs no group join, commits nothing, and leaves nothing in the coordinator.
+
+        **The isolation level is a correctness setting here, not a preference** (R8.10,
+        008 D10). At ``read_uncommitted`` a rebuild replays folds belonging to
+        transactions that aborted — which is precisely the corruption the transaction was
+        bought to prevent, reintroduced by the mechanism meant to repair it.
         """
         return Consumer(
             {
@@ -654,6 +679,7 @@ class LocalStateStore:
                 "enable.auto.commit": False,
                 "auto.offset.reset": "earliest",
                 "enable.partition.eof": True,
+                "isolation.level": isolation_level(self._settings),
             }
         )
 
@@ -680,12 +706,55 @@ class LocalStateStore:
             self._write_checkpoint(partition)
             store.close()
 
+    def discard(self, partitions: Iterable[int]) -> None:
+        """Delete these partitions' stores outright, checkpoints included (R8.11).
+
+        The counterpart to :meth:`forget`, and deliberately not a variant of it. ``forget``
+        releases a store believing it correct and leaves it on disk for whoever holds the
+        partition next. This throws it away, because an aborted transaction leaves the
+        store holding folds the changelog never received and there is no way to write a
+        disk record back out of existence.
+
+        Nothing is flushed on the way out — flushing would push records the transaction
+        just abandoned — and the checkpoint goes with the directory, because a checkpoint
+        for a store that no longer exists would have the next restore skip the records
+        that rebuild it.
+
+        Raises:
+            StateStoreUnavailable: If a directory cannot be removed. Consuming against a
+                store that could not be repaired is worse than stopping.
+        """
+        for partition in sorted(set(partitions)):
+            store = self._stores.pop(partition, None)
+            if store is not None:
+                store.close()
+            self._position.pop(partition, None)
+            path = self._path_for(partition)
+            checkpoint = self._checkpoint_path(partition)
+            try:
+                shutil.rmtree(path, ignore_errors=False)
+                checkpoint.unlink(missing_ok=True)
+            except OSError as exc:
+                raise StateStoreUnavailable(
+                    f"could not discard partition {partition} at {path}: {exc}"
+                ) from exc
+            logger.warning(
+                "[%s] STORE_DISCARDED partition=%d — rebuilding from %s",
+                self._group_id,
+                partition,
+                self._topic,
+            )
+
     def held(self) -> list[int]:
         """Return the partitions this instance currently holds a store for."""
         return sorted(self._stores)
 
     def close(self) -> None:
-        """Flush, checkpoint and close every open partition."""
+        """Flush, checkpoint and close every open partition.
+
+        The producer is **not** closed here: since 008 it belongs to ``main.py``, which
+        also writes the failure router through it (008 D1).
+        """
         self.forget(list(self._stores))
 
     # -- internals ------------------------------------------------------------------

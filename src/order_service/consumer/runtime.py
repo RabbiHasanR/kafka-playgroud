@@ -42,6 +42,7 @@ from confluent_kafka import (
     KafkaError,
     KafkaException,
     Message,
+    Producer,
     TopicPartition,
 )
 
@@ -61,6 +62,11 @@ from order_service.consumer.dlq import (
     decode_headers,
 )
 from order_service.consumer.errors import NonRetryableError, classify
+from order_service.consumer.transactions import (
+    ProducerFenced,
+    build_commit_strategy,
+    isolation_level,
+)
 from order_service.consumer.state import OrderFold, StateStore, StateStoreUnavailable
 from order_service.events import (
     EXPECTED_NEXT_EVENT,
@@ -162,8 +168,13 @@ def build_consumer_config(
         "bootstrap.servers": settings.kafka_bootstrap_servers,
         # One group per service (D7); 002's notification instances share one.
         "group.id": group_id,
-        # Committed by hand, after the handler runs (R1.32).
+        # Committed by hand, after the handler runs (R1.32). Under exactly_once the
+        # commit does not even go through this client — see 008 D4.
         "enable.auto.commit": False,
+        # R8.10 — read_committed by default, so a consumer never sees records belonging
+        # to a transaction that aborted. Settable, because seeing them is the clearest
+        # demonstration that an abort is a marker rather than an un-write.
+        "isolation.level": isolation_level(settings),
         # No committed offsets means a fresh group id replays the whole topic.
         "auto.offset.reset": "earliest",
         "client.id": client_id,
@@ -323,6 +334,7 @@ class ServiceConsumer:
         settings: Settings,
         store: StateStore,
         router: FailureRouter,
+        producer: Producer,
     ) -> None:
         """Build a consumer for one service.
 
@@ -330,17 +342,21 @@ class ServiceConsumer:
             spec: The service to run.
             settings: Resolved environment settings.
             store: Where folded state lives (003 D2). Injected rather than constructed
-                here so ``main.py`` can fail on an unreachable database *before* this
+                here so ``main.py`` can fail on an unreachable store *before* this
                 consumer exists, and so the backend is one substitution rather than a
                 branch inside the loop.
             router: Where a failed message goes (005 D3). Injected for the same reason
-                as ``store``, and shared with nothing — its producer belongs to this
-                process alone.
+                as ``store``, and since 008 writing through the same producer.
+            producer: The process's one producer (008 D1). Crosses this boundary only so
+                the commit strategy can be built here, where the ``Consumer`` it needs
+                for ``consumer_group_metadata()`` exists.
 
         Raises:
             ConsumerConfigError: If the settings are incompatible with the selected
                 group protocol (R2.21) — raised before the client is constructed, so
                 the process never joins the group.
+            ProducerFenced: If another producer already holds this process's
+                transactional identity (R8.5).
         """
         self._spec = spec
         self._settings = settings
@@ -355,6 +371,11 @@ class ServiceConsumer:
                 group_id=self._group_id,
                 client_id=f"order-service-{spec.name}-{self._instance}",
             )
+        )
+        # 008 D4 — the one place the guarantee is chosen. Everything downstream calls
+        # `_commit`, which does not know which of the two it is talking to.
+        self._commits = build_commit_strategy(
+            producer, self._consumer, settings, spec.name, self._instance
         )
 
     @property
@@ -420,16 +441,61 @@ class ServiceConsumer:
             self._settings.state_write_order,
             self._settings.state_crash_after,
         )
+        # R8.14 — which guarantee produced this run's observations, and under what
+        # identity. The interval is here because it is the difference between a run that
+        # measures throughput and one that measures the crash lever.
+        logger.info(
+            "[%s/%s] guarantee=%s transactional_id=%s isolation=%s commit_every=%s/%sms",
+            self._spec.name,
+            self._instance,
+            self._settings.processing_guarantee,
+            self._settings.transactional_id_for(self._group_id)
+            if self._settings.exactly_once
+            else "<none>",
+            self._settings.consumer_isolation_level,
+            self._settings.transaction_commit_interval_messages,
+            self._settings.transaction_commit_interval_ms,
+        )
+
+        # R8.13, D7 — the 003 lever is subsumed rather than broken, and saying so is what
+        # stops it looking broken. Not refused: meaningless is not the same as dangerous.
+        if self._settings.exactly_once and (
+            self._settings.state_write_order is StateWriteOrder.OFFSET_FIRST
+        ):
+            logger.warning(
+                "[%s/%s] STATE_WRITE_ORDER=%s ignored under guarantee=%s — a transaction "
+                "has no order between the fold write and the offset",
+                self._spec.name,
+                self._instance,
+                self._settings.state_write_order,
+                self._settings.processing_guarantee,
+            )
 
         try:
             while self._running:
                 message = self._consumer.poll(1.0)
                 if message is None:
+                    # R8.8, D5 — the interval is checked here too. A transaction opened by
+                    # the last message of a burst would otherwise stay open through the
+                    # lull, holding every read_committed reader downstream at the last
+                    # stable offset for as long as the quiet lasted.
+                    self._settle()
                     continue
                 if message.error():
                     self._handle_error(message)
                     continue
                 self._handle_message(message)
+                self._settle()
+        except ProducerFenced as exc:
+            # R8.5 — another producer took this identity. Not retried: the epoch is behind
+            # for good, so every transactional call from here would fail the same way.
+            logger.error(
+                "[%s/%s] PRODUCER_FENCED — exiting; is CONSUMER_INSTANCE_ID unique? %s",
+                self._spec.name,
+                self._instance,
+                exc,
+            )
+            raise
         except StateStoreUnavailable as exc:
             # R3.22 — unlike a rejected commit, a dead state store must stop the loop.
             logger.error(
@@ -441,6 +507,10 @@ class ServiceConsumer:
             )
             raise
         finally:
+            # Before the consumer closes: an open transaction covers work whose offsets
+            # were never submitted, and aborting is the honest close — those messages go
+            # back to whoever is assigned the partitions next (R8.9).
+            self._commits.close()
             self._consumer.close()
             logger.info("[%s] consumer closed", self._spec.name)
 
@@ -470,8 +540,21 @@ class ServiceConsumer:
         self._store.restore({tp.partition for tp in partitions})
 
     def _on_revoke(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
-        """Log partitions given up and release exactly their state (R2.14, R3.9)."""
+        """Log partitions given up, abort any open transaction, release their state.
+
+        The abort comes first (R8.9). An open transaction holds offsets for partitions
+        this member is about to stop owning, and submitting those on the next commit
+        would be the failure ``COMMIT_REJECTED`` already reports on the at-least-once
+        path — except that inside a transaction it fences the producer rather than
+        merely warning.
+
+        No discard-and-rebuild follows, unlike :meth:`_abort_and_repair`. These stores are
+        being released anyway, and whoever is assigned them next rebuilds from the
+        changelog under R7.7 — which reads ``read_committed`` and so cannot see anything
+        the abort just discarded (R2.14, R3.9).
+        """
         self._log_membership("REVOKED", partitions)
+        self._commits.abort("partitions revoked")
         self._forget(partitions)
 
     def _on_lost(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
@@ -484,8 +567,13 @@ class ServiceConsumer:
         This is also where 003's sequence guard earns its keep: an evicted member can
         finish a handler and write *after* its replacement has moved the order on. That
         write loses to the guard rather than corrupting the new owner's state (003 D3).
+
+        Under a transaction the guard is not what saves it — fencing is. An evicted member
+        that tries to commit is rejected by its epoch, so the abort here is tidiness rather
+        than the last line of defence (R8.9).
         """
         self._log_membership("LOST", partitions)
+        self._commits.abort("partitions lost")
         self._forget(partitions)
 
     def _log_membership(self, event: str, partitions: list[TopicPartition]) -> None:
@@ -825,10 +913,10 @@ class ServiceConsumer:
         fold: OrderFold,
         partition: int,
     ) -> None:
-        """Write the fold and commit the offset, in the configured order (003 D4).
+        """Write the fold and settle the offset, however the guarantee says to.
 
-        Two writes, two systems, and no operation covering both. Which one goes first
-        decides *how* that gap fails:
+        **Under ``at_least_once`` (003 D4)** these are two writes, two systems, and no
+        operation covering both. Which one goes first decides *how* that gap fails:
 
         ==================  ==========================================================
         ``state_first``     crash in the gap → the event is redelivered, the fold write
@@ -844,10 +932,27 @@ class ServiceConsumer:
         The default is not a preference (R3.5). The lever exists so the other outcome
         can be watched rather than asserted (R3.16, R3.18).
 
+        **Under ``exactly_once`` (008 D7, D8)** the table above stops applying, because
+        there is no gap for it to describe. The changelog record and the offset are in one
+        transaction, so neither ordering nor a flush means anything: ``commit_transaction``
+        is what makes both real, and it is :meth:`_settle` that calls it. ``STATE_WRITE_ORDER``
+        is therefore logged as ignored rather than refused — it is meaningless here, not
+        dangerous, and refusing it would make a working 003 lever look broken.
+
         Raises:
             StateStoreUnavailable: If the state store fails. Deliberately not caught
                 here — see :meth:`run` (R3.22).
         """
+        if self._settings.exactly_once:
+            self._save_fold(event, fold, partition)
+            # No flush: the record is inside a transaction, and pushing it to the broker
+            # early would neither make it visible nor make it safe (R8.6).
+            self._commit(message)
+            # AFTER the offset joins the transaction, so a crash here leaves BOTH
+            # uncommitted — which is the whole point of the point (R8.13).
+            self._crash_if_configured(StateCrashPoint.TRANSACTION_OPEN, event)
+            return
+
         if self._settings.state_write_order is StateWriteOrder.OFFSET_FIRST:
             self._commit(message)
             self._crash_if_configured(StateCrashPoint.OFFSET_COMMIT, event)
@@ -914,23 +1019,82 @@ class ServiceConsumer:
         os._exit(1)
 
     def _commit(self, message: Message) -> None:
-        """Commit one offset, surviving the loss of the partition it belongs to.
+        """Record that this message is done, however the guarantee says to (008 D4).
 
-        Under scale-out this can fail for a reason 001 could not produce: the member was
-        evicted or the partition was revoked mid-handler, so the offset is somebody
-        else's now. That is logged under its own marker — deliberately not 001's
-        ``VIOLATION``, which means "the data was wrong" rather than "our membership
-        changed underneath us" — and consumption continues so the member rejoins
-        (R2.26, R2.27, D8).
+        The single seam every branch of the loop goes through — the snapshot branch, the
+        not-ours retry branch, the tombstone path, the fold write and the failure route.
+        Keeping it single is what let the guarantee become one injected object rather
+        than five conditionals.
+
+        Under ``at_least_once`` this commits the offset immediately, exactly as 007 did.
+        Under ``exactly_once`` it records the offset in the open transaction, where it
+        stays until :meth:`_settle` commits the batch.
+        """
+        self._commits.note(message)
+
+    def _settle(self) -> None:
+        """Commit the open transaction if its interval has been reached (R8.8).
+
+        A no-op under ``at_least_once``, where :meth:`_commit` already committed.
+
+        Raises:
+            ProducerFenced: If this process's transactional identity has been taken.
         """
         try:
-            self._consumer.commit(message=message, asynchronous=False)
+            self._commits.maybe_commit()
         except KafkaException as exc:
-            logger.warning(
-                "[%s/%s] COMMIT_REJECTED partition=%d offset=%d reason=%s",
+            # The transaction did not commit, so its records were never made visible and
+            # its offsets were never submitted. Abort, repair the stores it wrote to, and
+            # let the messages be redelivered.
+            logger.error(
+                "[%s/%s] TRANSACTION_COMMIT_FAILED — aborting: %s",
                 self._spec.name,
                 self._instance,
-                message.partition(),
-                message.offset(),
-                exc.args[0] if exc.args else exc,
+                exc,
+            )
+            self._abort_and_repair("commit failed")
+
+    def _abort_and_repair(self, reason: str) -> None:
+        """Abort the open transaction and rebuild whatever local state it dirtied (R8.11).
+
+        The transaction covers the changelog records and the offsets. It does not cover
+        the RocksDB writes, which have already happened and cannot be rolled back — so
+        the partitions it wrote to are discarded and replayed from the changelog, whose
+        ``read_committed`` view holds only what actually committed.
+
+        Then each is sought back to its committed offset, which is exactly where the
+        aborted transaction began. Nothing needs to track that: it is what "committed"
+        means.
+
+        Raises:
+            StateStoreUnavailable: If a store cannot be discarded or rebuilt.
+        """
+        touched = self._commits.abort(reason)
+        if not touched:
+            return
+        self._store.discard(touched)
+        self._store.restore(touched)
+        for partition in sorted(touched):
+            self._rewind_partition(partition)
+
+    def _rewind_partition(self, partition: int) -> None:
+        """Reset one partition to its committed offset, for every topic assigned."""
+        assigned = [tp for tp in self._consumer.assignment() if tp.partition == partition]
+        if not assigned:
+            return
+        try:
+            for committed in self._consumer.committed(assigned, timeout=10.0):
+                # A partition with nothing committed rewinds to where the group's
+                # auto.offset.reset would put it, which `seek` cannot express — leaving
+                # the position alone is correct, since nothing was ever committed past.
+                if committed.offset < 0:
+                    continue
+                self._consumer.seek(committed)
+        except KafkaException as exc:
+            logger.error(
+                "[%s/%s] could not rewind partition %d after an abort: %s",
+                self._spec.name,
+                self._instance,
+                partition,
+                exc,
             )

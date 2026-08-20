@@ -4,7 +4,7 @@ import socket
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -71,11 +71,57 @@ class StateCrashPoint(StrEnum):
     cannot be hit by hand, so without a deliberate crash point R3.17 and R3.18 are
     unreachable and the dual-write problem stays a claim. This is 003's counterpart to
     001's ``force`` flag and 002's ``handler_delay_seconds``.
+
+    ``TRANSACTION_OPEN`` was added at 008 (D8). It fires inside an open transaction,
+    after the fold has been written and the offset noted and *before*
+    ``commit_transaction()`` — the window the other two points cannot reach, because
+    under a transaction the two writes they sit between are no longer separable.
     """
 
     NONE = "none"
     STATE_WRITE = "state_write"
     OFFSET_COMMIT = "offset_commit"
+    TRANSACTION_OPEN = "transaction_open"
+
+
+class ProcessingGuarantee(StrEnum):
+    """What a committed offset is allowed to mean (008 D2, D4).
+
+    ``AT_LEAST_ONCE`` is 001–007's behaviour and stays the default: the changelog write
+    and the offset commit are two operations with a window between them, which is what
+    ``StateWriteOrder`` orders and ``StateCrashPoint`` opens. A crash in that window
+    replays work, and ``handled_count`` outruns ``last_sequence`` as a result.
+
+    ``EXACTLY_ONCE`` puts both inside one transaction, so the pair either lands or does
+    not. It is off by default for the same reason ``MEMORY`` is the default state
+    backend: the earlier behaviour is the control the later one is measured against, and
+    a lesson with no control is an assertion (R8.2, R8.14).
+
+    What it does **not** promise is that a handler runs once. A redelivery after an abort
+    runs it again; what the transaction guarantees is that nothing which ran twice was
+    ever committed twice.
+    """
+
+    AT_LEAST_ONCE = "at_least_once"
+    EXACTLY_ONCE = "exactly_once"
+
+
+class IsolationLevel(StrEnum):
+    """Whether a consumer can see records inside transactions that never committed
+    (008 D10).
+
+    ``READ_COMMITTED`` is the default and is required for correctness on the changelog
+    restore reader: a rebuild that replays aborted folds reintroduces exactly the state
+    corruption the transaction was bought to prevent (R8.11).
+
+    ``READ_UNCOMMITTED`` is kept settable because it is the clearest demonstration in
+    the feature. An aborted transaction does not un-write its records — they are
+    physically on the topic, and the abort is a marker over them. Pointing a console
+    consumer at the changelog with this value is how that stops being a claim.
+    """
+
+    READ_COMMITTED = "read_committed"
+    READ_UNCOMMITTED = "read_uncommitted"
 
 
 class ProducerAcks(StrEnum):
@@ -192,6 +238,29 @@ class Settings(BaseSettings):
         handler_failure_orders: Which order ids the lever applies to. Unset means every
             order, which is rarely what you want — name the orders.
         handler_failure_attempts: How many attempts ``transient`` fails before succeeding.
+        processing_guarantee: Whether the changelog write and the offset commit are one
+            transaction (008 D2). Defaults to ``at_least_once``, which is 007's
+            behaviour unchanged.
+        producer_idempotence: Whether producers get a producer id and per-partition
+            sequence numbers, so the broker deduplicates a retried produce and rejects
+            an out-of-order one (008 D9). Defaults on. Turning it off is what 001–007
+            ran as, and is the control for the reordering it prevents. Transactions
+            force it on regardless of this value.
+        consumer_isolation_level: Whether a consumer sees records belonging to
+            transactions that never committed (008 D10). Read by every consumer,
+            including the changelog restore reader, where ``read_committed`` is a
+            correctness requirement rather than a preference.
+        transaction_commit_interval_messages: How many messages one transaction covers
+            before it is committed (008 D5). ``1`` means one transaction per message,
+            which is what the ``transaction_open`` crash point wants and what the
+            throughput comparison is measured against.
+        transaction_commit_interval_ms: How long a transaction may stay open before it
+            is committed regardless of message count (008 D5). Checked on empty polls
+            too, or a transaction opened by the last message of a burst would hold every
+            ``read_committed`` reader at the last stable offset until traffic resumed.
+        transaction_timeout_ms: How long the broker waits before aborting a transaction
+            this producer has stopped advancing. Must stay under the broker's
+            ``transaction.max.timeout.ms``, which is 15 minutes by default.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -242,6 +311,14 @@ class Settings(BaseSettings):
     handler_failure_orders: str | None = None
     handler_failure_attempts: int = 2
 
+    # -- spec 008: idempotence, transactions, and exactly-once ------------------
+    processing_guarantee: ProcessingGuarantee = ProcessingGuarantee.AT_LEAST_ONCE
+    producer_idempotence: bool = True
+    consumer_isolation_level: IsolationLevel = IsolationLevel.READ_COMMITTED
+    transaction_commit_interval_messages: int = 100
+    transaction_commit_interval_ms: int = 200
+    transaction_timeout_ms: int = 60_000
+
     delivery_timeout_seconds: float = 10.0
 
     order_service_host: str = "0.0.0.0"
@@ -267,9 +344,60 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @model_validator(mode="after")
+    def _refuse_checkpoint_under_exactly_once(self) -> "Settings":
+        """Reject the one setting pair that would silently restore wrong state (R8.12).
+
+        A checkpoint asserts that the local store already matches the changelog up to a
+        recorded offset. An aborted transaction makes that false — the store holds folds
+        the changelog never received — and the abort's repair is to rebuild from the
+        changelog, which a checkpoint would have the rebuild skip.
+
+        Refused rather than silently downgraded to a full rebuild: a lever that quietly
+        stops meaning what it says is worse than one that will not start.
+
+        Raises:
+            ValueError: If ``exactly_once`` is selected together with ``checkpoint``.
+        """
+        if (
+            self.processing_guarantee is ProcessingGuarantee.EXACTLY_ONCE
+            and self.state_rebuild is StateRebuild.CHECKPOINT
+        ):
+            raise ValueError(
+                "PROCESSING_GUARANTEE=exactly_once cannot be combined with "
+                "STATE_REBUILD=checkpoint — an aborted transaction leaves the local "
+                "store ahead of the changelog, and a checkpoint would have the rebuild "
+                "skip exactly the records that repair it. Use STATE_REBUILD=full."
+            )
+        return self
+
+    @property
+    def exactly_once(self) -> bool:
+        """Return whether the read-process-write cycle runs inside a transaction."""
+        return self.processing_guarantee is ProcessingGuarantee.EXACTLY_ONCE
+
     def group_id_for(self, service_name: str) -> str:
         """Return the configured group id, or ``<service_name>-service``."""
         return self.consumer_group_id or f"{service_name}-service"
+
+    def transactional_id_for(self, group_id: str) -> str:
+        """Return this process's transactional identity (R8.3, 008 D3).
+
+        Must be **stable across restarts** or fencing is decorative: a restarted
+        instance carrying a fresh identity cannot fence the zombie it replaced, which is
+        the entire purpose of having one. Both halves are already resolved in the
+        process, so nothing new is invented here — but it does promote
+        ``CONSUMER_INSTANCE_ID`` from a log field into a correctness-critical setting.
+        Two members sharing one value will fence each other in a loop, each bumping the
+        epoch the other just took; R8.5 is what makes that loud rather than silent.
+
+        Args:
+            group_id: The consumer group this process is a member of.
+
+        Returns:
+            ``<group_id>-<instance_label>``.
+        """
+        return f"{group_id}-{self.instance_label}"
 
     def changelog_topic_for(self, group_id: str) -> str:
         """Return the changelog topic holding one consumer group's folded state (R7.1).

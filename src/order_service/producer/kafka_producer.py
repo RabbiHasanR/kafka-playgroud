@@ -5,6 +5,14 @@ acknowledgement arrives later on a delivery callback, and callbacks only fire wh
 somebody calls ``poll()``. Hence the background poll thread — without it a caller
 waiting on a delivery report would wait forever.
 
+From 008 the producer is **idempotent** by default (R8.1). It is not, and will not be,
+*transactional*: a transaction covers a consume-process-produce cycle, and there is no
+consumed offset here to fold into one. What idempotence buys is that ``retries`` can no
+longer duplicate or — the part that matters — reorder. What nothing here buys is safety at
+the HTTP boundary: a client whose request times out after the broker accepted the write
+retries and produces a genuinely new event with a new ``event_id``. That gap needs an
+idempotency key or a transactional outbox, and no spec claims either.
+
 From 006 this class writes to two topics. Lifecycle events go to ``order-lifecycle`` and
 block on their delivery report; snapshots and tombstones go to the compacted
 ``order-snapshot``, where the snapshot does *not* block and the tombstone does (006 D3).
@@ -84,6 +92,15 @@ class LifecycleEventProducer:
                 # librdkafka's name for what the Java client calls delivery.timeout.ms —
                 # so `retries` alone cannot keep a message in flight past this.
                 "message.timeout.ms": settings.producer_message_timeout_ms,
+                # 008 R8.1 — the retry settings above are exactly what makes this
+                # necessary. Without it, a retry after a lost acknowledgement writes the
+                # record twice, and a retry while later batches are already in flight
+                # writes them OUT OF ORDER. The second is the one that hurts here: this
+                # domain is an ordered lifecycle, so a SHIPPED that overtakes a PACKED
+                # makes every consumer report a violation that never happened.
+                #
+                # Off is what 001–007 ran as, and is kept reachable as the control (R8.2).
+                "enable.idempotence": settings.producer_idempotence,
                 # murmur2 on the key, as Java does: one order, one partition (R1.10).
                 "partitioner": "consistent_random",
                 "client.id": "order-service-producer",

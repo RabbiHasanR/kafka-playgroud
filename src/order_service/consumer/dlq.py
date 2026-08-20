@@ -6,9 +6,16 @@ sends one that will not to the terminal topic. Both publish the **original bytes
 than a re-serialised event, because a message that failed to *decode* has no event to
 serialise — and because a replay should put back exactly what was produced.
 
-Both block until the broker acknowledges. That is not politeness: the caller commits the
-source offset immediately afterwards, and committing an offset for a message that was
-never durably moved anywhere loses it silently (D3).
+Both block until the broker acknowledges — at least once. That is not politeness: the
+caller commits the source offset immediately afterwards, and committing an offset for a
+message that was never durably moved anywhere loses it silently (D3).
+
+Under ``PROCESSING_GUARANTEE=exactly_once`` the blocking stops, because the reason for it
+is gone (008 D1). The source offset now goes into the same transaction as the record
+published here, so the two can no longer separate and there is nothing to order against.
+``commit_transaction()`` is the acknowledgement, and the producer is no longer this class's
+to own — it is the process's one producer, shared with the state store's changelog, because
+every write inside one transaction must come from one instance (R8.4, R8.7).
 
 The headers are the whole value of the dead-letter topic. Without them it is a pile of
 bytes nobody can act on; ``x-original-offset`` is what makes a replay provable rather
@@ -142,32 +149,30 @@ def describe_error(exc: BaseException) -> tuple[str, str]:
 class FailureRouter:
     """Publishes failed messages to the retry and dead-letter topics (D3, D7)."""
 
-    def __init__(self, settings: Settings) -> None:
-        """Build the router's producer.
+    def __init__(self, settings: Settings, producer: Producer) -> None:
+        """Take the producer this router publishes through.
 
         Args:
             settings: Resolved environment settings, for the topic names and brokers.
+            producer: The process's one producer, built and owned by ``main.py`` (R8.4,
+                008 D1). This class built its own until 008, with the ``acks=all`` that
+                has moved to ``transactions.build_producer`` unchanged. It cannot own one
+                any more: under a transaction the dead-letter write and the source offset
+                must land together, and every write inside one transaction has to come
+                from one producer instance — the same one the state store's changelog
+                goes through.
         """
         self._settings = settings
-        self._producer = Producer(
-            {
-                "bootstrap.servers": settings.kafka_bootstrap_servers,
-                # Hardcoded, unlike the order producer's PRODUCER_ACKS lever (004 D5).
-                # A dead letter is the *record* that a message could not be processed;
-                # publishing it at acks=0 could lose the evidence while the consumer
-                # commits the offset regardless, which is the one outcome this whole
-                # feature exists to prevent.
-                "acks": "all",
-                "partitioner": "consistent_random",
-                "client.id": "order-service-failure-router",
-            }
-        )
+        self._producer = producer
 
     def close(self, flush_timeout: float = 10.0) -> None:
-        """Flush anything still buffered."""
-        remaining = self._producer.flush(flush_timeout)
-        if remaining:
-            logger.warning("failure router flush left %d message(s) unsent", remaining)
+        """Do nothing — the producer belongs to ``main.py`` now (008 D1).
+
+        Kept so the caller's shutdown sequence reads the same on both paths. Flushing
+        here would be wrong under a transaction: it would push records the transaction
+        may be about to abort.
+        """
+        del flush_timeout
 
     def to_retry(
         self,
@@ -316,11 +321,20 @@ class FailureRouter:
     def _publish(
         self, *, topic: str, message: Message, headers: dict[str, str]
     ) -> None:
-        """Publish one message and block until the broker acknowledges it.
+        """Publish one message, blocking until the broker acknowledges it where that is
+        what makes the offset safe.
 
         No background poll thread, unlike ``LifecycleEventProducer`` (001 D6): this is
         only ever called from a consume loop that is already blocked on the result, so
         ``flush()`` is both the wait and the callback pump.
+
+        **Under a transaction the wait moves** (008 D1). At-least-once has to block here,
+        because the caller commits the source offset immediately afterwards and an offset
+        committed for a message that was never durably moved loses it. Under
+        ``exactly_once`` the offset is *inside* this transaction, so the two cannot
+        separate: ``commit_transaction()`` is the acknowledgement, and blocking per
+        message would only defeat the batching D5 exists to provide. A record that never
+        lands makes the commit fail, and the abort path repairs it.
 
         Raises:
             FailurePublishFailed: If the publication errored or was not acknowledged in
@@ -345,6 +359,9 @@ class FailureRouter:
             )
         except (BufferError, KafkaException) as exc:
             raise FailurePublishFailed(f"could not enqueue for {topic}: {exc}") from exc
+
+        if self._settings.exactly_once:
+            return
 
         remaining = self._producer.flush(self._settings.delivery_timeout_seconds)
         if remaining or not done.is_set():

@@ -267,8 +267,8 @@ and put a genuinely out-of-order event on the log; all three services will repor
 | Orders held in memory — a restart forgets them | accepted (a real service uses a database) |
 | No transactional outbox, so the record and the event cannot be atomic | out of scope; explained in the flow doc |
 | Consumer fold state lost on restart | **closed by 003** |
-| Duplicate processing after a crash (at-least-once) | 008 — 003 absorbs it in the *state*, not in the side effect |
-| No deduplication, though every event carries an `event_id` | 008 — 003 gets idempotency from `sequence` instead |
+| Duplicate processing after a crash (at-least-once) | **partly closed by 008** — the committed *state* is exactly-once; the handler still runs twice |
+| No deduplication, though every event carries an `event_id` | unclaimed — 008 removes the duplicate *effect* a dedup table existed to prevent, so no spec adds one |
 
 ---
 
@@ -374,7 +374,11 @@ banner names which backend is in force, so no run is ambiguous.
 The offset commits to Kafka and the fold is written somewhere else, and **no operation
 covers both**. `STATE_CRASH_AFTER` makes that gap reachable: crash after the state write
 and the event is redelivered, absorbed by the sequence guard, and the handler runs twice —
-`handled_count` ends up above `last_sequence`, which is the residue 008 removes.
+`handled_count` ends up above `last_sequence`, which is the residue **008 removes from the
+durable fold**. Be precise about what that means: under a transaction the aborted increment
+is discarded, so the stored `handled_count` equals `last_sequence` — but the handler still
+*ran* twice, and notification still printed its message twice. Exactly-once is a property of
+committed output, never of execution.
 
 ```bash
 # the same residue, still visible after 007 — now in the log rather than a table
@@ -388,8 +392,8 @@ operations, which is exactly why 008 can cover them with one transaction and 003
 
 | Gap | Closed by |
 |---|---|
-| Duplicate side effects after a crash between the two writes | 008 |
-| Offset and state cannot be written atomically | 008 |
+| Duplicate side effects after a crash between the two writes | **not closed by 008** — a transaction cannot un-run a handler or un-send an email |
+| Offset and state cannot be written atomically | **closed by 008** for the changelog and the offset; the local RocksDB write stays outside and is rebuilt on abort |
 | Shared database, not state co-partitioned with the input | **closed by 007** |
 | Rebuild cost grows with history, not with key count | **closed by 007** |
 | The producer's own `OrderStore` is still in memory | transactional outbox; no spec claims it |
@@ -513,11 +517,11 @@ Four things it demonstrates:
 | Gap | Closed by |
 |---|---|
 | Head-of-line blocking in the retry lane — one topic, per-message delays | open by design; tiered delay topics are the fix, left unbuilt so the stall is watchable |
-| A committed offset no longer means "processed" | 008, where one transaction covers the publication and the commit |
+| A committed offset no longer means "processed" | **closed by 008** — the retry/dead-letter publication and the offset are one transaction |
 | `SEQUENCE_GAP` warnings while a retry is in flight | inherent to non-blocking retry; the honest signal, not noise |
 | Dead letters expire with the topic's default retention | never claimed; no criterion sets retention |
 | Nothing alerts on dead-letter depth | out of scope — a dead-letter topic nobody watches is a silent loss bucket |
-| Producer retries can reorder without `enable.idempotence` | 008 |
+| Producer retries can reorder without `enable.idempotence` | **closed by 008** — idempotence is on by default on every producer |
 | One worker means one service's backoff holds up the others' | accepted; the fix is a worker per service |
 
 ---
@@ -665,9 +669,88 @@ between the two topics forever.
 
 | Gap | Closed by |
 |---|---|
-| The changelog produce and the offset commit are still two operations | 008 — one transaction covers both, which a database write never could |
-| `handled_count` still exceeds `last_sequence` | 008 |
+| The changelog produce and the offset commit are still two operations | **closed by 008** — one transaction covers both, which a database write never could |
+| `handled_count` still exceeds `last_sequence` | **closed by 008** in the durable fold; the handler still runs twice on a redelivery |
 | A deliberate replay from earliest still resurrects a deleted order | needs an `ORDER_DELETED` terminal event; 006 placed it out of scope |
 | A rebuild longer than `max.poll.interval.ms` evicts the member mid-restore | inherent; `STATE_REBUILD=checkpoint` is the mitigation |
 | The event log now carries republished messages the producer never wrote | accepted; the alternative puts the backoff wait back in the consume loop |
 | 005's `R5.9` still describes the worker folding state itself | wording needs amending; see [X13](DECISIONS.md) |
+
+---
+
+# Spec 008 — Transactions and Exactly-Once Semantics
+
+Two mechanisms, constantly confused with each other, built here as two things.
+
+**An idempotent producer** stops one producer duplicating or reordering its own retries. It
+is on by default on every producer in the system. Duplication this project already absorbed
+— the sequence guard from 003 exists for it. **Reordering is the half that hurts**: the
+domain is an ordered lifecycle, so a `SHIPPED` that overtakes a `PACKED` makes
+`is_legal_transition` report a violation that never happened. On the compacted changelog it
+is worse — an older fold overwrites a newer one, compaction keeps the wrong value, and
+`restore()` rebuilds the corruption faithfully. No marker in this repository reports that.
+
+**A transaction** makes the changelog write and the offset commit land together or not at
+all. This is the thing the ladder was built to reach: 003 chose Postgres *knowing* it was
+wrong ([X4](DECISIONS.md)) so the dual-write problem would be unmissable, and 007 moved the
+fold onto a compacted topic so both sides became Kafka operations. A database could never
+have been covered this way.
+
+**The local store is outside the transaction, and that is the part configuration does not
+buy.** RocksDB is a disk write; nothing rolls it back. So an abort has a *repair* rather than
+a rollback — discard the partitions the transaction wrote to, replay them from the
+changelog's committed records, and seek back to the committed offset. This is why
+`STATE_REBUILD=checkpoint` is refused under the guarantee, and why the restore reader must
+read `read_committed`.
+
+**Exactly-once is a property of committed output, never of execution.** A redelivery after an
+abort runs the handler again and notification prints its message twice. What the transaction
+guarantees is that nothing which ran twice was ever *committed* twice.
+
+Read [docs/transactions-and-exactly-once.md](docs/transactions-and-exactly-once.md). Full spec
+in [specs/008-transactions-exactly-once/](specs/008-transactions-exactly-once/requirements.md).
+
+```bash
+docker compose up -d --build              # no `down -v`; no new topics, no broker change
+
+# off by default — a plain `up` still reproduces 007 exactly
+PROCESSING_GUARANTEE=exactly_once docker compose up -d --force-recreate
+
+./scripts/place_orders.sh 9
+docker compose logs inventory-consumer | grep guarantee=
+#   guarantee=exactly_once transactional_id=inventory-service-inventory-1
+#   isolation=read_committed commit_every=100/200ms
+```
+
+## Levers
+
+| Variable | What it reaches |
+|---|---|
+| `PROCESSING_GUARANTEE` | `at_least_once` (default, = 007) or `exactly_once` |
+| `PRODUCER_IDEMPOTENCE` | on by default; `false` is what 001–007 ran as |
+| `TRANSACTION_COMMIT_INTERVAL_MESSAGES` | `1` for the crash demos, `100` for throughput |
+| `CONSUMER_ISOLATION_LEVEL` | set `read_uncommitted` on a **console** consumer, never on these |
+| `STATE_CRASH_AFTER=transaction_open` | crash inside the open transaction, before the commit |
+
+The clearest thing in the feature: crash inside a transaction, then read the changelog both
+ways. The record is **absent** under `read_committed` and **present** under
+`read_uncommitted`. An abort does not un-write records — it is a marker over them.
+
+## What it forced elsewhere
+
+Every write inside one transaction must come from one producer instance, but `LocalStateStore`
+(007) and `FailureRouter` (005) each built their own. Both now take one, built in `main.py`
+([X14](DECISIONS.md)). And `CONSUMER_INSTANCE_ID`, a log field since 002, became half the
+`transactional.id` — so it must be stable and unique, or two members fence each other in a
+loop.
+
+## Known gaps, all deliberate
+
+| Gap | Closed by |
+|---|---|
+| A handler still runs twice on a redelivery | **inherent** — Kafka covers committed output, not execution |
+| External side effects (the notification message stands in for an email) | **inherent** — a transaction cannot un-send |
+| `POST /orders` retried by the client still produces a second event | unclaimed; needs an idempotency key or an outbox |
+| The retry worker's republish and commit are still two operations | open by design; a second transactional producer adds surface, not insight |
+| An abort pays a full restore for every partition it touched | inherent to holding state outside the transaction |
+| `read_committed` stalls readers at the last stable offset while a transaction is open | inherent; the commit interval is the lever |
