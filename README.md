@@ -1,756 +1,286 @@
 # Kafka Playground
 
-A three-broker Kafka 4.3.1 cluster in KRaft mode (no ZooKeeper) for hands-on CLI learning.
-It was a single node through spec 003; [spec 004](specs/004-replication-acks-failover/requirements.md)
-grew it to three.
+**Kafka's hard parts, one rung at a time — built spec-first.**
 
-| What | Where |
-|---|---|
-| Brokers (from host) | `localhost:9092`, `localhost:9094`, `localhost:9095` |
-| Brokers (from other containers) | `kafka:19092`, `kafka-2:19092`, `kafka-3:19092` |
-| Kafka UI | http://localhost:8080 |
-| CLI tools | `/opt/kafka/bin/` inside any broker container |
-| Log segments on disk | `/var/lib/kafka/data/` inside each container |
+![Kafka 4.3.1](https://img.shields.io/badge/Apache%20Kafka-4.3.1-231F20?logo=apachekafka&logoColor=white)
+![KRaft](https://img.shields.io/badge/mode-KRaft%20(no%20ZooKeeper)-231F20)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![confluent-kafka](https://img.shields.io/badge/client-confluent--kafka-blue)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
+![Docker Compose](https://img.shields.io/badge/run-Docker%20Compose-2496ED?logo=docker&logoColor=white)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-Node ids are 1, 2, 3; the container names are `kafka`, `kafka-2`, `kafka-3`. The first keeps
-its original name so every `docker exec kafka …` below still works.
-
-## Lifecycle
-
-```bash
-docker compose up -d          # start
-docker compose ps             # status (wait for kafka = healthy)
-docker compose logs -f kafka  # broker logs
-docker compose down           # stop, keep data
-docker compose down -v        # stop, WIPE all topics/messages
-```
-
-**Upgrading from the single-broker era needs `down -v` once.** KRaft writes the controller
-quorum into the metadata log at format time, so the old one-voter volume cannot grow into a
-three-voter cluster. Run `docker compose down -v && docker compose up -d && ./scripts/create_topics.sh`.
-See [docs/replication.md §6](docs/replication.md).
-
-Get a shell inside the broker — most commands below assume you're here:
-
-```bash
-docker exec -it kafka bash
-cd /opt/kafka/bin
-```
-
-`BS=localhost:9092` is used as shorthand below. Set it once per shell:
-
-```bash
-export BS=localhost:9092
-```
-
-## Topics
-
-```bash
-./kafka-topics.sh --bootstrap-server $BS --create --topic demo --partitions 3 --replication-factor 1
-./kafka-topics.sh --bootstrap-server $BS --list
-./kafka-topics.sh --bootstrap-server $BS --describe --topic demo
-./kafka-topics.sh --bootstrap-server $BS --alter --topic demo --partitions 6   # grow only, never shrink
-./kafka-topics.sh --bootstrap-server $BS --delete --topic demo
-```
-
-Reading `--describe`: `Leader` is the broker serving that partition, `Replicas` all
-brokers holding it, `Isr` the in-sync ones. On a single broker all three are `1`.
-
-Auto-create is **off** — a typo gives you an error instead of a silent empty topic.
-
-## Produce / consume
-
-```bash
-./kafka-console-producer.sh --bootstrap-server $BS --topic demo
-./kafka-console-consumer.sh --bootstrap-server $BS --topic demo --from-beginning
-```
-
-Useful consumer flags:
-
-```bash
---property print.key=true \
---property print.partition=true \
---property print.offset=true \
---property print.timestamp=true \
---max-messages 10 \
---partition 0            # read one partition only
---offset earliest        # with --partition: earliest | latest | <number>
-```
-
-Without `--from-beginning` a fresh consumer only sees messages produced *after* it starts.
-
-## Keys and partitioning
-
-```bash
-./kafka-console-producer.sh --bootstrap-server $BS --topic demo \
-  --property parse.key=true --property key.separator=:
-# then type:  user1:logged in
-```
-
-Same key always hashes to the same partition — that is Kafka's only ordering
-guarantee (ordering holds *within* a partition, never across).
-
-Keyless messages are spread round-robin (sticky-batched), so ordering is not preserved.
-
-## Consumer groups
-
-```bash
-./kafka-console-consumer.sh --bootstrap-server $BS --topic demo --group g1
-
-./kafka-consumer-groups.sh --bootstrap-server $BS --list
-./kafka-consumer-groups.sh --bootstrap-server $BS --describe --group g1
-./kafka-consumer-groups.sh --bootstrap-server $BS --describe --group g1 --members --verbose
-```
-
-`--describe` columns: `CURRENT-OFFSET` (committed), `LOG-END-OFFSET` (latest written),
-`LAG` = the difference. Lag is the number to watch in production.
-
-One partition is consumed by at most one member of a group. More consumers than
-partitions means the extras sit idle. Start/kill members and re-run `--describe`
-to watch rebalancing.
-
-## Offsets
-
-The group must have **no active members** to reset:
-
-```bash
-./kafka-consumer-groups.sh --bootstrap-server $BS --group g1 --topic demo --reset-offsets --to-earliest --execute
-./kafka-consumer-groups.sh --bootstrap-server $BS --group g1 --topic demo --reset-offsets --to-latest --execute
-./kafka-consumer-groups.sh --bootstrap-server $BS --group g1 --topic demo --reset-offsets --shift-by -10 --execute
-./kafka-consumer-groups.sh --bootstrap-server $BS --group g1 --topic demo --reset-offsets --to-offset 42 --execute
-./kafka-consumer-groups.sh --bootstrap-server $BS --group g1 --topic demo --reset-offsets --to-datetime 2026-08-09T00:00:00.000 --execute
-```
-
-Swap `--execute` for `--dry-run` to preview.
-
-## Inspecting the raw log
-
-```bash
-ls /var/lib/kafka/data/demo-0/
-./kafka-dump-log.sh --files /var/lib/kafka/data/demo-0/00000000000000000000.log --print-data-log
-```
-
-Shows real record batches, offsets, timestamps, and compression — the physical
-form of the "log" abstraction.
-
-Per-partition offset boundaries without consuming:
-
-```bash
-./kafka-get-offsets.sh --bootstrap-server $BS --topic demo               # latest
-./kafka-get-offsets.sh --bootstrap-server $BS --topic demo --time earliest
-```
-
-## Retention and compaction
-
-```bash
-./kafka-topics.sh --bootstrap-server $BS --create --topic compacted --partitions 1 --replication-factor 1 \
-  --config cleanup.policy=compact \
-  --config min.cleanable.dirty.ratio=0.01 \
-  --config segment.ms=5000 \
-  --config delete.retention.ms=100
-
-./kafka-configs.sh --bootstrap-server $BS --entity-type topics --entity-name demo --describe
-./kafka-configs.sh --bootstrap-server $BS --entity-type topics --entity-name demo \
-  --alter --add-config retention.ms=60000
-```
-
-Compaction keeps only the newest value per key. It runs on *closed* segments, so
-you must produce enough to roll a segment (hence the tiny `segment.ms`) before
-old values disappear. A key with a `null` value is a tombstone — it deletes the key.
-
-This is the mechanism [spec 006](#spec-006--compaction-and-tombstones) builds on, where
-`order-snapshot` is a real compacted topic and `DELETE /orders/{id}` writes a real
-tombstone. See [docs/compaction-and-tombstones.md](docs/compaction-and-tombstones.md) for
-why the *event* topic must not be compacted.
-
-## Other tools
-
-```bash
-./kafka-broker-api-versions.sh --bootstrap-server $BS   # connectivity check
-./kafka-cluster.sh cluster-id --bootstrap-server $BS
-./kafka-producer-perf-test.sh --topic demo --num-records 100000 --record-size 100 --throughput -1 --producer-props bootstrap.servers=$BS
-./kafka-consumer-perf-test.sh --bootstrap-server $BS --topic demo --messages 100000
-```
-
-## Gotchas
-
-- **`advertised.listeners` is what clients actually connect to.** The broker hands
-  this address back on connect, so a client that reaches the broker fine can still
-  fail on the next call if the advertised address is wrong. Hence the two listeners:
-  `localhost:9092` for the host, `kafka:19092` for containers.
-- **Partition count can only grow.** Growing it rehashes keys, so existing keys may
-  move to a different partition and their historical ordering is broken.
-- **`--from-beginning` is ignored when the group already has committed offsets.**
-  Reset the offsets or use a new `--group` name.
-- **`docker compose down -v` deletes the volume** and every message with it.
+A three-broker Kafka cluster and one order-processing pipeline, grown across nine
+numbered specs — each rung introducing a distributed-systems problem the previous
+rung was too naive to have.
 
 ---
 
-# Spec 001 — Prepaid Order Service
+## Why this exists
 
-A prepaid order is placed in one HTTP call; the service records it and publishes
-`ORDER_CREATED` to `order-lifecycle` (3 partitions, keyed by `order_id`). Three
-services — inventory, notification, analytics — each consume that event **in their own
-consumer group**, so all three see every message. The order is then advanced through
-`PACKED → SHIPPED → DELIVERED`, one event at a time, each fanning out again.
+Most Kafka material stops at produce and consume. That part is easy. The parts that
+are not easy — a rebalance that revokes a partition mid-batch, a consumer whose
+in-memory state evaporates when it loses ownership, one undecodable message that
+blocks a partition forever, a compacted topic that quietly eats your event history,
+a duplicate that survives an offset commit — only show up under load and failure,
+and only if you go looking for them.
 
-Read [docs/order-flow.md](docs/order-flow.md) first — it is one page and covers the
-whole flow with runnable commands. Full spec in
-[specs/001-prepaid-order-service/](specs/001-prepaid-order-service/requirements.md).
+So this repo goes looking, deliberately. One pipeline, built in order, where each
+step exists **because the previous step left a specific gap**. Every walkthrough
+ends with a *Known gaps, all deliberate* table naming the spec that closes each one;
+that table is the spine of the project, not an apology. Nothing was built because it
+seemed like a good idea — each rung starts as a written requirement, gets a design
+with its rejected alternatives recorded, and is only then implemented.
 
-Three things it demonstrates:
-
-- **Key → partition.** Every event is keyed by `order_id`, so one order's events land
-  on one partition and stay ordered. Different orders have no ordering guarantee
-  between them, and that is correct rather than a limitation.
-- **Fan-out by consumer group.** One topic, three group ids, three independent
-  offsets. [Spec 002](#spec-002--consumer-groups-rebalancing-and-partition-assignment)
-  does the opposite — extra consumers in *one* group, where the messages divide instead
-  of duplicating.
-- **The synchronous/asynchronous boundary.** `POST /orders` blocks because the caller
-  needs an `order_id` back. Everything downstream of the event does not, and happens
-  off the log.
-
-## Running it
-
-```bash
-docker compose up -d --build            # broker, UI, order service, 3 consumers
-./scripts/create_topics.sh              # creates every topic (auto-create is off)
-docker compose logs -f inventory-consumer notification-consumer analytics-consumer
-```
-
-From the host instead, four terminals:
-
-```bash
-.venv/bin/python -m order_service.producer.app                        # :8010
-SERVICE_NAME=inventory    .venv/bin/python -m order_service.consumer.main
-SERVICE_NAME=notification .venv/bin/python -m order_service.consumer.main
-SERVICE_NAME=analytics    .venv/bin/python -m order_service.consumer.main
-```
-
-| Endpoint (`:8010`) | Purpose |
-|---|---|
-| `POST /orders` | create a prepaid order; `422` if the payment ≠ the item sum |
-| `POST /orders/{order_id}/events` | advance it; `409` if the transition is illegal |
-| `GET /orders/{order_id}` | the service's own record of the order |
-| `DELETE /orders/{order_id}` | delete it by publishing a tombstone ([spec 006](#spec-006--compaction-and-tombstones)) |
-
-Advancing one order through the chain, with `ORDER` holding the id `POST /orders`
-returned. Watch the three consumer logs between each call — every one of them sees
-every event, and they land on the same partition because the key is the `order_id`:
-
-```bash
-curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
-  -d '{"event_type":"PACKED"}'
-
-curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
-  -d '{"event_type":"SHIPPED","payload":{"carrier":"Pathao","tracking_number":"PT-1"}}'
-
-curl -sX POST localhost:8010/orders/$ORDER/events -H 'content-type: application/json' \
-  -d '{"event_type":"DELIVERED"}'
-
-curl -s localhost:8010/orders/$ORDER
-```
-
-The full walkthrough, including the failure cases, is in
-[docs/order-flow.md](docs/order-flow.md).
-
-The order service **guards its own lifecycle** — asking for `SHIPPED` on an unpacked
-order is a `409`, not a message on a topic. Pass `"force": true` to bypass the guard
-and put a genuinely out-of-order event on the log; all three services will report an
-`ILLEGAL_TRANSITION` violation with no accompanying sequence gap.
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| Orders held in memory — a restart forgets them | accepted (a real service uses a database) |
-| No transactional outbox, so the record and the event cannot be atomic | out of scope; explained in the flow doc |
-| Consumer fold state lost on restart | **closed by 003** |
-| Duplicate processing after a crash (at-least-once) | **partly closed by 008** — the committed *state* is exactly-once; the handler still runs twice |
-| No deduplication, though every event carries an `event_id` | unclaimed — 008 removes the duplicate *effect* a dedup table existed to prevent, so no spec adds one |
+It is a study, not production software. It is built like production software.
 
 ---
 
-# Spec 002 — Consumer Groups, Rebalancing, and Partition Assignment
+## Architecture
 
-001 put three **group ids** on one topic and every service saw every message. 002 puts
-three **members in one group** and the messages divide. Both run at once, on the same
-topic: `notification` scales to three instances while `inventory` and `analytics` stay
-single-instance as the control.
+```mermaid
+flowchart LR
+    C(["POST /orders"]) --> API["FastAPI order service<br/>:8010"]
+    DEL(["DELETE /orders/{id}"]) --> API
 
-Read [docs/consumer-groups.md](docs/consumer-groups.md) — it has the measured numbers.
-Full spec in [specs/002-consumer-groups-rebalancing/](specs/002-consumer-groups-rebalancing/requirements.md).
+    API -->|"key = order_id"| LIFE[("order-lifecycle<br/>3 partitions · RF 3")]
+    API -->|tombstone| SNAP[("order-snapshot<br/>compacted")]
 
-```bash
-docker compose up -d --build              # group starts with ONE notification member
-./scripts/create_topics.sh                # required after `down -v`
-docker compose --profile scale-out up -d  # grow it to three, while watching the logs
-./scripts/place_orders.sh 12 --advance    # 12 orders × 4 events, no curl by hand
+    LIFE --> INV["inventory-service"]
+    LIFE --> NOT["notification-service<br/>×3 instances, one group"]
+    LIFE --> ANA["analytics-service"]
 
-docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-  --describe --group notification-service --members --verbose
+    INV & NOT & ANA -->|retryable failure| RETRY[("order-lifecycle.retry")]
+    RETRY --> RW["retry-worker"]
+    RW -->|budget spent| DLQ[("order-lifecycle.dlq")]
+    RW -->|reprocess| LIFE
+    DLQ -.->|"dlq_replay --publish"| LIFE
+
+    INV & NOT & ANA <-->|"read-process-write<br/>in one transaction"| CL[("order-fold.&lt;group&gt;<br/>compacted changelog")]
+    INV & NOT & ANA --- ST[["RocksDB store<br/>one per owned partition"]]
 ```
 
-Tear down with `docker compose --profile scale-out down` — a plain `down` orphans
-`notification-consumer-2` and `-3`.
-
-Four things it demonstrates:
-
-- **Scale-out divides, fan-out duplicates.** 12 of 12 orders went to exactly one group
-  member each, while inventory and analytics each received all 12 complete.
-- **Ordering survives parallelism.** The key pins an order to a partition and the
-  partition to one member, so all four of an order's events are handled by one consumer
-  in sequence — 12 of 12, with three consumers running.
-- **A rebalance costs whatever it revokes.** Killing one member under the default `range`
-  assignor destroyed the folded state of **6 of 6** in-flight orders; under
-  `cooperative-sticky` the same scenario cost **3 of 9** — only the partition that moved.
-- **The offset is not the memory.** Kafka restored every position perfectly and restored
-  no derived state at all. That gap is what spec 003 exists to close.
-
-| Lever | What it causes |
-|---|---|
-| `CONSUMER_ASSIGNMENT_STRATEGY=cooperative-sticky` | revoke only what moves |
-| `CONSUMER_GROUP_PROTOCOL=consumer` | KIP-848 — the broker assigns, not a client |
-| `HANDLER_DELAY_SECONDS=12` + a low `CONSUMER_MAX_POLL_INTERVAL_MS` | a live, healthy consumer evicted from its group, then livelocked |
-| `STATIC_MEMBERSHIP=1` | a restart that costs **0** rebalances instead of 8 |
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| A moved partition loses its fold → false `SEQUENCE_GAP` | 003, **fully closed by 007** |
-| Rebalance duration and consumer lag are never measured | needs a load generator, excluded here |
-| Partition growth and key rehashing | a topic-level lesson, not a consumer-group one |
-| Single broker, RF 1 | **closed by 004** |
+Three brokers in KRaft mode (`kafka`, `kafka-2`, `kafka-3` — all voters, no
+ZooKeeper), on host ports `9092`, `9094`, `9095`. Topic auto-creation is off on
+purpose, so a typo is an error rather than a silent empty topic. Each consumer keeps
+its fold in an embedded RocksDB store scoped to the partitions it currently owns, and
+rebuilds it from its group's compacted changelog when a rebalance hands it a new one.
 
 ---
 
-# Spec 003 — Durable Consumer State
+## The ladder
 
-001 and 002 both ended with the same false alarm: a consumer that resumed at exactly the
-right offset and reported a `SEQUENCE_GAP` for events it had already seen. **Kafka
-remembers your position; nothing remembered your memory.** 003 moves the fold into
-Postgres, keyed by `(group_id, order_id)` — so it belongs to the *order*, not to whoever
-holds the partition — and the false alarm stops.
+| # | What it adds | Kafka concepts | Deep dive |
+|---|---|---|---|
+| [000](specs/000-foundations/requirements.md) | The cluster itself, in Docker, reachable from host and containers | KRaft, listeners vs advertised listeners, topics, partitions, offsets, log segments | [kafka-cli.md](docs/kafka-cli.md) |
+| [001](specs/001-prepaid-order-service/requirements.md) | An HTTP order service publishing a lifecycle; three services consuming it | Keys → partitions, ordering per key, fan-out via distinct `group.id`, at-least-once | [order-flow.md](docs/order-flow.md) |
+| [002](specs/002-consumer-groups-rebalancing/requirements.md) | Three notification instances in **one** group, dividing the partitions | Partitions as the unit of parallelism, rebalance cost, `cooperative-sticky`, KIP-848, static membership | [consumer-groups.md](docs/consumer-groups.md) |
+| [003](specs/003-durable-consumer-state/requirements.md) | The fold moves out of process, so it survives losing a partition | Offsets vs derived state, the dual-write problem, idempotent writes, duplicate absorption | [durable-state.md](docs/durable-state.md) |
+| [004](specs/004-replication-acks-failover/requirements.md) | One broker becomes three, and `acks` becomes a lever | Replication factor, replica set vs ISR, leader election and failover, `acks=0/1/all` | [replication.md](docs/replication.md) |
+| [005](specs/005-retries-dlq-poison-messages/requirements.md) | A failure path: retry topic, dead-letter topic, bounded replay | Head-of-line blocking, transient vs poison, commit ≠ processed, `min.insync.replicas` | [retries-and-dlq.md](docs/retries-and-dlq.md) |
+| [006](specs/006-compaction-tombstones/requirements.md) | `DELETE /orders/{id}` via a second, compacted snapshot topic | `cleanup.policy=compact` vs `delete` — table vs log, the log cleaner, tombstones | [compaction-and-tombstones.md](docs/compaction-and-tombstones.md) |
+| [007](specs/007-local-state-stores-changelog/requirements.md) | Embedded RocksDB per owned partition, restored from a per-group changelog | Co-partitioned local state, changelog topics, restore cost = keys not events, store locks | [local-state-and-changelog.md](docs/local-state-and-changelog.md) |
+| [008](specs/008-transactions-exactly-once/requirements.md) | Idempotent producers, then read-process-write transactions | `enable.idempotence`, `transactional.id`, `read_committed`, last stable offset, fencing | [transactions-and-exactly-once.md](docs/transactions-and-exactly-once.md) |
 
-> **Postgres was replaced at [007](#spec-007--local-state-stores-and-changelog-topics).**
-> It was always the knowingly-weaker option ([X4](DECISIONS.md)), chosen because a
-> database makes the dual-write problem impossible to miss. The reasoning below is what
-> this section is for; the backend it describes is now an embedded store per instance.
-
-Read [docs/durable-state.md](docs/durable-state.md) — it has the measured numbers.
-Full spec in [specs/003-durable-consumer-state/](specs/003-durable-consumer-state/requirements.md).
-
-```bash
-cp .env.example .env                      # no credentials in it since 007
-docker compose up -d --build
-./scripts/create_topics.sh                # required after `down -v`
-docker compose --profile scale-out up -d  # three notification members
-```
-
-The same rebalance that 002 recorded, now run twice one variable apart:
-
-```bash
-docker compose --profile scale-out up -d && ./scripts/place_orders.sh 9
-docker stop notification-consumer-2        # 0 of 3 orders report a gap
-
-STATE_BACKEND=memory docker compose --profile scale-out up -d
-docker stop notification-consumer-2        # 4 of 4 do — this is 002's result
-```
-
-`STATE_BACKEND` defaults to **`memory`**, so a consumer started with none of 003's settings
-still reproduces 001's and 002's recorded experiments. Compose turns it on. The startup
-banner names which backend is in force, so no run is ambiguous.
-
-## Levers
-
-| Variable | Default | What it is for |
-|---|---|---|
-| `STATE_BACKEND` | `memory` | `memory` \| `local` (was `postgres` until 007) |
-| `STATE_WRITE_ORDER` | `state_first` | `offset_first` loses data permanently, on purpose |
-| `STATE_CRASH_AFTER` | `none` | `state_write` \| `offset_commit` — opens the dual-write window |
-
-The offset commits to Kafka and the fold is written somewhere else, and **no operation
-covers both**. `STATE_CRASH_AFTER` makes that gap reachable: crash after the state write
-and the event is redelivered, absorbed by the sequence guard, and the handler runs twice —
-`handled_count` ends up above `last_sequence`, which is the residue **008 removes from the
-durable fold**. Be precise about what that means: under a transaction the aborted increment
-is discarded, so the stored `handled_count` equals `last_sequence` — but the handler still
-*ran* twice, and notification still printed its message twice. Exactly-once is a property of
-committed output, never of execution.
-
-```bash
-# the same residue, still visible after 007 — now in the log rather than a table
-docker compose logs | grep DUPLICATE_ABSORBED
-```
-
-Both levers survived 007 unchanged. What changed is that *both* writes are now Kafka
-operations, which is exactly why 008 can cover them with one transaction and 003 could not.
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| Duplicate side effects after a crash between the two writes | **not closed by 008** — a transaction cannot un-run a handler or un-send an email |
-| Offset and state cannot be written atomically | **closed by 008** for the changelog and the offset; the local RocksDB write stays outside and is rebuilt on abort |
-| Shared database, not state co-partitioned with the input | **closed by 007** |
-| Rebuild cost grows with history, not with key count | **closed by 007** |
-| The producer's own `OrderStore` is still in memory | transactional outbox; no spec claims it |
-
+Full run-throughs — commands, expected output, levers, deliberate gaps — are in
+**[docs/walkthroughs.md](docs/walkthroughs.md)**.
 
 ---
 
-# Spec 004 — Replication, `acks`, and Failover
+## Quickstart
 
-001, 002 and 003 were all consumer-side lessons running on **one copy of every message**.
-Stopping the broker was never an experiment because everything stopped at once. 004 makes the
-cluster three nodes, gives every partition three replicas, and turns the producer's `acks` —
-hardcoded to `all` since 001 — into one environment variable.
-
-Read [docs/replication.md](docs/replication.md). Full spec in
-[specs/004-replication-acks-failover/](specs/004-replication-acks-failover/requirements.md).
+Requires Docker and Docker Compose. Nothing else — Python runs inside the images.
 
 ```bash
-docker compose down -v                    # required once, coming from a single-broker volume
-docker compose up -d --build
-./scripts/create_topics.sh                # RF 3 by default now
-
-# leader, replicas, and the in-sync set — three different facts
-docker exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --describe --topic order-lifecycle
-
-./scripts/place_orders.sh 5 --advance
-docker stop kafka-2                       # a leader dies
-./scripts/place_orders.sh 5 --advance     # the producer never noticed
-docker start kafka-2                      # Isr returns to three
+cp .env.example .env
+docker compose up -d --build        # 3 brokers + UI + producer + 3 consumers + retry worker
+./scripts/create_topics.sh          # auto-create is off, deliberately
+./scripts/place_orders.sh 12 --advance
 ```
 
-Four things it demonstrates:
+Then look at:
 
-- **The ISR is the number that moves.** `Replicas` is fixed at topic creation and does not
-  change when a broker dies. `Isr` shrinks within seconds and grows back on restart.
-- **Failover needs no operator.** The controller elects a new leader from the ISR and
-  librdkafka refreshes its metadata onto it. Nothing restarts, nothing is reconfigured.
-- **Replication belongs to the topic, not the cluster.** An RF 1 topic on a healthy
-  three-broker cluster still loses a partition when its one node stops, while `order-lifecycle`
-  at RF 3 beside it carries on.
-- **`acks=all` does not mean all replicas.** It means all replicas *currently in sync* — and an
-  ISR that has shrunk to one member satisfies it completely.
-
-| Lever | What it causes |
+| Where | What |
 |---|---|
-| `PRODUCER_ACKS=0` | the producer returns before the broker confirms anything, and never reports a loss |
-| `PRODUCER_ACKS=1` | the leader's log only — a leader crash before replication still loses the write |
-| `REPLICATION_FACTOR=1` | an under-replicated topic, to lose a partition on purpose |
+| http://localhost:8080 | Kafka UI — topics, partitions, consumer groups, lag |
+| http://localhost:8010/docs | The order service's OpenAPI page |
+| `docker compose logs -f inventory-consumer` | The fold advancing, one event at a time |
+| `docker exec -it kafka bash` | A broker shell; CLI tools in `/opt/kafka/bin/` |
 
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| `acks=all` satisfied by an ISR of one — `min.insync.replicas` not set | **closed by 005** — set to 2, with the producer retry path a refusal needs |
-| Unclean leader election and deliberate committed-data loss | not scheduled; the row above is now closed, so this is reachable |
-| What `acks` costs in latency, measured | needs a load generator, excluded from this ladder |
-| Replica placement, rack awareness, partition reassignment | never claimed |
-
----
-
-# Spec 005 — Retries, the Dead-Letter Topic, and Poison Messages
-
-Until now a handler could not fail. `runtime.py` said so in the type it declared, and the one
-failure it did handle — a message that would not decode — was **logged and committed anyway**,
-because the alternative was stalling the partition forever. That is silent data loss, and it
-was the right call only because there was nowhere else to put the message.
-
-005 builds the somewhere else, and separates three things that used to look identical.
-
-Read [docs/retries-and-dlq.md](docs/retries-and-dlq.md). Full spec in
-[specs/005-retries-dlq-poison-messages/](specs/005-retries-dlq-poison-messages/requirements.md).
+A few things worth trying next:
 
 ```bash
-docker compose up -d --build              # no `down -v` this time
-./scripts/create_topics.sh                # adds the retry and dead-letter topics
-
-# a message that fails twice and then works
-ORDER=$(./scripts/place_orders.sh 1 | grep -oE 'ord-[a-z0-9-]+' | head -1)
-# both containers: the consumer spends attempt 1, the worker spends the rest
-HANDLER_FAILURE_MODE=transient HANDLER_FAILURE_ORDERS=$ORDER \
-  docker compose up -d --force-recreate inventory-consumer retry-worker
-docker compose logs -f inventory-consumer retry-worker \
-  | grep -E 'RETRY_SCHEDULED|RETRY_WAITING|RETRY_SUCCEEDED'
-
-# a message that can never work
-./scripts/produce_poison.sh               # not JSON at all
-./scripts/produce_poison.sh schema        # valid JSON, wrong shape
-
-# what gave up, and putting it back
-docker compose run --rm retry-worker python -m order_service.tools.dlq_replay
-docker compose run --rm retry-worker python -m order_service.tools.dlq_replay --publish
-```
-
-Four things it demonstrates:
-
-- **A transient failure and a poison message are opposites.** Retrying the first works;
-  retrying the second produces the identical exception and spends the budget proving it. So
-  classification comes first, and a poison message reaches the dead-letter topic having made
-  exactly **one** attempt, never touching the retry topic.
-- **In Kafka, giving up in place is not an option.** A partition is read in order, so a
-  consumer that keeps retrying offset 847 never commits past it and everything behind it waits.
-  The message has to *move*, not wait — which is why the source offset commits immediately.
-- **Non-blocking retry buys throughput with ordering.** While a message waits in the retry lane
-  the next event for the same order is folded ahead of it, and `SEQUENCE_GAP` fires. That
-  warning is correct — the service really has not processed the earlier event yet.
-- **Replay reaches every consumer group.** Republishing to `order-lifecycle` delivers to all
-  three groups, not only the one that failed. The two that already succeeded absorb it through
-  003's sequence guard and log `DUPLICATE_ABSORBED`.
-
-| Lever | What it causes |
-|---|---|
-| `HANDLER_FAILURE_MODE=transient` | fails `HANDLER_FAILURE_ATTEMPTS` attempts, then succeeds |
-| `HANDLER_FAILURE_MODE=poison` | fails every attempt, so the message is dead on arrival |
-| `scripts/produce_poison.sh` | genuinely malformed bytes, so the *decoder* fails rather than a handler |
-| `RETRY_BACKOFF_SECONDS=120,5` | a long-delayed message ahead of a short one, to watch the retry lane stall |
-| `MIN_INSYNC_REPLICAS=2` + `docker compose stop kafka-2 kafka-3` | a write the cluster refuses |
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| Head-of-line blocking in the retry lane — one topic, per-message delays | open by design; tiered delay topics are the fix, left unbuilt so the stall is watchable |
-| A committed offset no longer means "processed" | **closed by 008** — the retry/dead-letter publication and the offset are one transaction |
-| `SEQUENCE_GAP` warnings while a retry is in flight | inherent to non-blocking retry; the honest signal, not noise |
-| Dead letters expire with the topic's default retention | never claimed; no criterion sets retention |
-| Nothing alerts on dead-letter depth | out of scope — a dead-letter topic nobody watches is a silent loss bucket |
-| Producer retries can reorder without `enable.idempotence` | **closed by 008** — idempotence is on by default on every producer |
-| One worker means one service's backoff holds up the others' | accepted; the fix is a worker per service |
-
----
-
-# Spec 006 — Compaction and Tombstones
-
-Nothing here could delete an order. Fixing that needs the one Kafka mechanism the ladder
-had not met: a topic that behaves as a **table** rather than a log.
-
-`cleanup.policy=compact` retains the latest value per key indefinitely and garbage-collects
-the rest, so replaying rebuilds current state at a cost proportional to the number of
-**keys** rather than the number of **events**. A `null` value under a key — a **tombstone** —
-erases the key, and then, after `delete.retention.ms`, erases itself.
-
-**It cannot go on `order-lifecycle`, and that is the lesson.** An order is four messages
-under one key, each an *increment*: `PACKED` does not carry the items, `SHIPPED` does not
-carry the payment. Compaction would keep only the newest and leave a `DELIVERED` event with
-no creation behind it — a permanent `SEQUENCE_GAP` and an unreconstructable order.
-Compaction is safe only where a message **replaces** its predecessor, never where it **adds**
-to it. So 006 adds a second, compacted topic and leaves the event log alone.
-
-Read [docs/compaction-and-tombstones.md](docs/compaction-and-tombstones.md). Full spec in
-[specs/006-compaction-tombstones/](specs/006-compaction-tombstones/requirements.md).
-
-```bash
-docker compose up -d --build              # no `down -v` this time
-./scripts/create_topics.sh                # adds order-snapshot, the compacted one
-
-ORDER=$(./scripts/place_orders.sh 1 | grep -oE 'ord-[a-z0-9-]+' | head -1)
-for E in PACKED SHIPPED DELIVERED; do
-  curl -sX POST localhost:8010/orders/$ORDER/events \
-    -H 'content-type: application/json' -d "{\"event_type\":\"$E\"}" >/dev/null
-done
-
-# the table: several values per key, until the cleaner runs
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server kafka:19092 --topic order-snapshot --from-beginning \
-  --property print.key=true --timeout-ms 5000
-
-# delete it — 204, and a null value appears under the key
-curl -i -X DELETE localhost:8010/orders/$ORDER
-docker compose logs --since 1m | grep TOMBSTONE
-
-# and the fold is gone from all three groups
-docker compose logs --since 1m | grep "TOMBSTONE order_id=$ORDER"
-```
-
-| Lever | What it causes |
-|---|---|
-| `SNAPSHOT_SEGMENT_MS` | how soon a segment closes — the cleaner never touches the active one |
-| `SNAPSHOT_MIN_CLEANABLE_DIRTY_RATIO` | how much garbage before cleaning is worth it (Kafka's default 0.5 makes it invisible) |
-| `SNAPSHOT_DELETE_RETENTION_MS` | how long a tombstone lingers before erasing itself |
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| A restart or rebalance resurrects a deleted order | **closed by 007** — the changelog is the store's only source, and it carries the tombstone |
-| A **deliberate replay from earliest** resurrects a deleted order | still open — re-reading the log re-folds the events, and the changelog tombstone only protects for `delete.retention.ms`. Needs the `ORDER_DELETED` event below. |
-| A pending retry recreates a deleted fold | **closed by 007** — the retry is republished and folded through the same tombstoned store |
-| `dlq_replay.py` can republish a deleted order | still open — same root cause as the replay row |
-| The fold is derived from two topics with independent retention | **closed by 007** — the store's only source is its changelog |
-| No `ORDER_DELETED` event on the log — the delete lives only in the table | out of scope; needs a new `EventType` and a terminal `OrderState` |
-| A lost snapshot write is repaired only by the next event, and `DELIVERED` has none | accepted; the event log is the source of truth |
-| The snapshot topic's cleaner settings are unrealistic | accepted; production values in the doc |
-
----
-
-# Spec 007 — Local State Stores and Changelog Topics
-
-003 put the fold in Postgres **knowing it was the wrong long-term answer** —
-[X4](DECISIONS.md) says so in writing and books itself as *superseded by X5 at 007*. A
-database made the dual-write problem impossible to miss, which was the point. It also left
-one shared table that five processes contend on, holding rows for orders the member reading
-them does not own the events for.
-
-007 moves the fold onto **each instance's own disk** — one embedded RocksDB store per
-partition it owns — and makes it recoverable with a **compacted changelog topic** per
-consumer group. Rebuilding a partition replays that topic's matching partition, at a cost
-proportional to the number of **keys** rather than the number of **events**. That is what
-006's compaction was built for, and it is the mechanism Kafka Streams runs on internally.
-
-**The changelog is per group, and that is forced rather than chosen.** The three services
-walk an order's stages at their own pace — inventory can sit at `PACKED` while notification
-is at `SHIPPED` — and compaction keeps the latest value **per key**. One topic keyed by
-`order_id` would have them overwrite each other. Putting the group in the *key* instead
-fixes compaction and breaks partitioning, because the key is what the partitioner hashes.
-So the group goes in the **topic name** ([X13](DECISIONS.md)).
-
-Read [docs/local-state-and-changelog.md](docs/local-state-and-changelog.md). Full spec in
-[specs/007-local-state-stores-changelog/](specs/007-local-state-stores-changelog/requirements.md).
-
-```bash
-docker compose up -d --build              # no `down -v`; the image gains rocksdict
-./scripts/create_topics.sh                # adds order-fold.<group> ×3, compacted
+# scale the notification group to 3 instances and watch the partitions divide
 docker compose --profile scale-out up -d
+docker compose --profile scale-out down          # same flag to tear down
 
-./scripts/place_orders.sh 9
+# make a handler fail on purpose, and follow the message into retry and DLQ
+HANDLER_FAILURE_MODE=transient docker compose up -d inventory-consumer
+./scripts/produce_poison.sh schema
 
-# co-partitioned state, as directories: one per partition this instance OWNS
-docker compose exec notification-consumer-1 ls -R /var/lib/order-state
+# see what gave up, then put it back
+docker compose exec inventory-consumer python -m order_service.tools.dlq_replay
+docker compose exec inventory-consumer python -m order_service.tools.dlq_replay --publish
 
-# the changelog: one live value per order, plus tombstones
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server kafka:19092 --topic order-fold.notification-service \
-  --from-beginning --property print.key=true --timeout-ms 5000
-
-# the rebuild, and what it cost — `records` vs `keys` is the whole feature
-docker compose restart notification-consumer-1
-docker compose logs notification-consumer-1 | grep -E "REBALANCE|RESTORED"
-#   REBALANCE ASSIGNED partitions=[0] held=[]
-#   RESTORED partition=0 records=1180 keys=94 from=0 to=1180 mode=full ms=412
+# kill a leader and watch the ISR shrink
+docker stop kafka-2
 ```
 
-## Levers
+To run the Python on the host instead of in containers:
 
-| Variable | Default | What it is for |
-|---|---|---|
-| `STATE_BACKEND` | `memory` (compose: `local`) | `memory` is still 002's amnesia, unchanged |
-| `STATE_DIR` | `/var/lib/order-state` | where the per-partition stores live |
-| `STATE_CHANGELOG_PREFIX` | `order-fold` | topics are `<prefix>.<group_id>` |
-| `STATE_REBUILD` | `full` | `checkpoint` resumes instead of replaying — compare the two `RESTORED` lines |
-| `FOLD_SEGMENT_MS` / `FOLD_MIN_CLEANABLE_DIRTY_RATIO` / `FOLD_DELETE_RETENTION_MS` | `10000` / `0.01` / `60000` | the changelog's cleaner, tunable apart from the snapshot's |
-
-`full` is the default even though Kafka Streams checkpoints: under `checkpoint` a warm
-restart reads nothing, and the number this feature exists to show would be visible exactly
-once.
-
-## What it forced elsewhere
-
-An embedded store takes an **exclusive lock** on its directory, so only the process holding
-a partition can write that partition's fold. The retry worker used to write folds directly
-— possible only because a database accepts connections from anywhere. It is now a pure
-**scheduler**: it waits out the backoff and republishes the message to the topic it came
-from, where the owning instance runs the handler and folds it.
-
-Two headers make that safe. `x-retry-target` names the one service the retry is for, so the
-other two groups do not re-run handlers that already succeeded. `x-attempt` carries the
-attempt count forward, so a republished message cannot restart its budget and ping-pong
-between the two topics forever.
-
-**With local state, work travels to the state — not state to the worker.**
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| The changelog produce and the offset commit are still two operations | **closed by 008** — one transaction covers both, which a database write never could |
-| `handled_count` still exceeds `last_sequence` | **closed by 008** in the durable fold; the handler still runs twice on a redelivery |
-| A deliberate replay from earliest still resurrects a deleted order | needs an `ORDER_DELETED` terminal event; 006 placed it out of scope |
-| A rebuild longer than `max.poll.interval.ms` evicts the member mid-restore | inherent; `STATE_REBUILD=checkpoint` is the mitigation |
-| The event log now carries republished messages the producer never wrote | accepted; the alternative puts the backoff wait back in the consume loop |
-| 005's `R5.9` still describes the worker folding state itself | wording needs amending; see [X13](DECISIONS.md) |
+```bash
+python -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/python -m order_service.producer.app                                    # :8010
+SERVICE_NAME=inventory .venv/bin/python -m order_service.consumer.main            # or notification / analytics
+.venv/bin/python -m order_service.consumer.retry_worker
+```
 
 ---
 
-# Spec 008 — Transactions and Exactly-Once Semantics
+## HTTP API
 
-Two mechanisms, constantly confused with each other, built here as two things.
+| Method | Path | Behaviour |
+|---|---|---|
+| `POST` | `/orders` | Places a prepaid order. `422` if the payment does not equal the item sum. |
+| `POST` | `/orders/{id}/events` | Advances the lifecycle `PACKED → SHIPPED → DELIVERED`. `409` on an illegal transition; `"force": true` bypasses the check so you can produce out-of-order events on purpose. |
+| `GET` | `/orders/{id}` | The producer's own view of the order. |
+| `DELETE` | `/orders/{id}` | `204`, and publishes a tombstone to the compacted snapshot topic. |
 
-**An idempotent producer** stops one producer duplicating or reordering its own retries. It
-is on by default on every producer in the system. Duplication this project already absorbed
-— the sequence guard from 003 exists for it. **Reordering is the half that hurts**: the
-domain is an ordered lifecycle, so a `SHIPPED` that overtakes a `PACKED` makes
-`is_legal_transition` report a violation that never happened. On the compacted changelog it
-is worse — an older fold overwrites a newer one, compaction keeps the wrong value, and
-`restore()` rebuilds the corruption faithfully. No marker in this repository reports that.
+---
 
-**A transaction** makes the changelog write and the offset commit land together or not at
-all. This is the thing the ladder was built to reach: 003 chose Postgres *knowing* it was
-wrong ([X4](DECISIONS.md)) so the dual-write problem would be unmissable, and 007 moved the
-fold onto a compacted topic so both sides became Kafka operations. A database could never
-have been covered this way.
+## Configuration
 
-**The local store is outside the transaction, and that is the part configuration does not
-buy.** RocksDB is a disk write; nothing rolls it back. So an abort has a *repair* rather than
-a rollback — discard the partitions the transaction wrote to, replay them from the
-changelog's committed records, and seek back to the committed offset. This is why
-`STATE_REBUILD=checkpoint` is refused under the guarantee, and why the restore reader must
-read `read_committed`.
+Every behaviour that could reasonably be a lever *is* a lever, set by environment
+variable, so a rung can be turned on and off without editing code. The ones that
+change the most:
 
-**Exactly-once is a property of committed output, never of execution.** A redelivery after an
-abort runs the handler again and notification prints its message twice. What the transaction
-guarantees is that nothing which ran twice was ever *committed* twice.
+| Variable | Does |
+|---|---|
+| `PROCESSING_GUARANTEE` | `at_least_once` (default) or `exactly_once` — wraps changelog write + offset commit in a transaction |
+| `PRODUCER_IDEMPOTENCE` | Stops the producer duplicating *and reordering* its own retries |
+| `PRODUCER_ACKS` | `0` / `1` / `all` — how much durability a write waits for |
+| `STATE_BACKEND` | `local` (RocksDB + changelog) or `memory` (the pre-007 amnesia, for comparison) |
+| `HANDLER_FAILURE_MODE` | Injects `transient` or `permanent` handler failures to exercise the retry and DLQ paths |
+| `RETRY_MAX_ATTEMPTS` | How much budget a message gets before the dead-letter topic |
 
-Read [docs/transactions-and-exactly-once.md](docs/transactions-and-exactly-once.md). Full spec
-in [specs/008-transactions-exactly-once/](specs/008-transactions-exactly-once/requirements.md).
+[`.env.example`](.env.example) is the annotated full list — every value commented out
+with a working default, grouped by the spec that introduced it. There are no
+credentials in it; nothing in this repo takes a secret.
 
-```bash
-docker compose up -d --build              # no `down -v`; no new topics, no broker change
+---
 
-# off by default — a plain `up` still reproduces 007 exactly
-PROCESSING_GUARANTEE=exactly_once docker compose up -d --force-recreate
+## How this repo is built: spec-driven development
 
-./scripts/place_orders.sh 9
-docker compose logs inventory-consumer | grep guarantee=
-#   guarantee=exactly_once transactional_id=inventory-service-inventory-1
-#   isolation=read_committed commit_every=100/200ms
+The pipeline is the subject; the method is the point. No code is written until three
+documents are approved, in order:
+
+```
+requirements.md  →  approve  →  design.md  →  approve  →  tasks.md  →  approve  →  implement
 ```
 
-## Levers
+**Requirements are EARS-shaped and individually addressable.** Each acceptance
+criterion gets a stable ID that design sections and tasks cite by name:
 
-| Variable | What it reaches |
+> **R7.5** — IF an event arrives at or below the stored sequence for its order THEN
+> THE SYSTEM SHALL leave the fold unchanged and SHALL count the delivery, so that a
+> redelivery is absorbed exactly as R3.11 and R3.13 required of the database.
+
+"Fast", "reliable" and "robust" are not criteria. A criterion names a number or an
+observable behaviour, or it does not go in.
+
+**Every task cites the requirements it implements**, which makes traceability
+mechanical rather than aspirational:
+
+```bash
+$ .claude/tools/spec-status.sh
+── 007-local-state-stores-changelog
+   requirements: 15 declared, 15 covered
+   tasks:        13/13 complete
+   ✓ fully traced
+```
+
+The script checks both directions — requirements with no task, and tasks citing a
+requirement that was never declared — and exits non-zero on either. Anything in the
+code that no requirement asked for is scope creep, and gets flagged rather than
+quietly kept.
+
+**The three documents have different standings.** `requirements.md` is a contract and
+changes only by an explicit decision. `design.md` describes reality and is amended
+when the implementation teaches it something. Decisions that cut across features —
+why Postgres was chosen at 003 knowing it was wrong, why the changelog is per group
+rather than per order — live in [`DECISIONS.md`](DECISIONS.md) as `X1…X14`, so a
+later spec can cite the reasoning instead of relitigating it.
+
+**There is no test suite, on purpose.** This is a learning repository about broker
+behaviour; a green assertion that a mock rebalanced correctly would prove nothing
+worth knowing. Verification is manual and by hand — run it against the real cluster,
+kill a broker, watch what the group does. That choice is recorded rather than
+implied, and [`CLAUDE.md`](CLAUDE.md) forbids adding tests so the convention cannot
+drift back in accidentally.
+
+---
+
+## Repo layout
+
+```
+specs/                      nine features, each requirements.md + design.md + tasks.md
+docs/                       one concept essay per rung, plus the CLI reference
+src/order_service/
+  config.py                 every env lever, validated at startup
+  events.py                 the lifecycle event model and its legal transitions
+  producer/                 FastAPI app, routes, the Kafka producer wrapper
+  consumer/
+    main.py                 entry point; SERVICE_NAME picks the handler
+    runtime.py              the consume loop and rebalance callbacks
+    state.py                state backends: memory, or RocksDB + changelog restore
+    transactions.py         read-process-write transactions (spec 008)
+    dlq.py, retry_worker.py the failure path (spec 005)
+  tools/dlq_replay.py       bounded, report-first dead-letter replay
+scripts/                    create_topics.sh, place_orders.sh, produce_poison.sh
+docker-compose.yml          3-broker KRaft cluster, UI, and every service
+DECISIONS.md                cross-cutting decisions X1…X14
+CLAUDE.md                   the project's own working rules
+```
+
+---
+
+## Using this yourself
+
+1. **Fork or clone it**, then follow the [Quickstart](#quickstart). Everything runs
+   locally; nothing needs an account or a cloud.
+2. **Pick your rung.** If you care about rebalancing, read
+   [consumer-groups.md](docs/consumer-groups.md) and
+   [spec 002's walkthrough](docs/walkthroughs.md#spec-002--consumer-groups-rebalancing-and-partition-assignment);
+   if you care about exactly-once, start at 008. The `docs/` essays stand alone.
+3. **See the world as it was.** Each rung landed as one `feat(NNN)` commit, so
+   `git log --oneline` then `git checkout <sha>` gives you the codebase exactly as it
+   was before the next problem existed — including the naive version the next spec
+   replaces.
+4. **Add your own rung.** Spec `009` is unclaimed. Read
+   [CONTRIBUTING.md](CONTRIBUTING.md) for the gate sequence and the requirement-ID
+   conventions.
+
+---
+
+## Documentation index
+
+| Document | Subject |
 |---|---|
-| `PROCESSING_GUARANTEE` | `at_least_once` (default, = 007) or `exactly_once` |
-| `PRODUCER_IDEMPOTENCE` | on by default; `false` is what 001–007 ran as |
-| `TRANSACTION_COMMIT_INTERVAL_MESSAGES` | `1` for the crash demos, `100` for throughput |
-| `CONSUMER_ISOLATION_LEVEL` | set `read_uncommitted` on a **console** consumer, never on these |
-| `STATE_CRASH_AFTER=transaction_open` | crash inside the open transaction, before the commit |
+| [docs/kafka-cli.md](docs/kafka-cli.md) | Raw broker CLI — topics, groups, offsets, dumping log segments |
+| [docs/walkthroughs.md](docs/walkthroughs.md) | Per-spec run-throughs, levers, and deliberate gaps |
+| [docs/order-flow.md](docs/order-flow.md) | Keys, partitions, and the sync/async boundary |
+| [docs/consumer-groups.md](docs/consumer-groups.md) | Group membership, assignment strategies, rebalance protocols |
+| [docs/durable-state.md](docs/durable-state.md) | Offsets vs derived state, and the dual-write problem |
+| [docs/replication.md](docs/replication.md) | Replicas, the ISR, `acks`, and leader failover |
+| [docs/retries-and-dlq.md](docs/retries-and-dlq.md) | Head-of-line blocking, retry topics, poison messages |
+| [docs/compaction-and-tombstones.md](docs/compaction-and-tombstones.md) | The log cleaner, tombstones, and table-vs-log |
+| [docs/local-state-and-changelog.md](docs/local-state-and-changelog.md) | Co-partitioned RocksDB stores and changelog restore |
+| [docs/transactions-and-exactly-once.md](docs/transactions-and-exactly-once.md) | Idempotence, transactions, fencing, isolation levels |
+| [docs/concurrency-and-confluent-kafka.md](docs/concurrency-and-confluent-kafka.md) | How `confluent-kafka`'s threading model shapes the consume loop |
+| [DECISIONS.md](DECISIONS.md) | Cross-cutting decisions and the alternatives rejected |
 
-The clearest thing in the feature: crash inside a transaction, then read the changelog both
-ways. The record is **absent** under `read_committed` and **present** under
-`read_uncommitted`. An abort does not un-write records — it is a marker over them.
+---
 
-## What it forced elsewhere
+## License
 
-Every write inside one transaction must come from one producer instance, but `LocalStateStore`
-(007) and `FailureRouter` (005) each built their own. Both now take one, built in `main.py`
-([X14](DECISIONS.md)). And `CONSUMER_INSTANCE_ID`, a log field since 002, became half the
-`transactional.id` — so it must be stable and unique, or two members fence each other in a
-loop.
-
-## Known gaps, all deliberate
-
-| Gap | Closed by |
-|---|---|
-| A handler still runs twice on a redelivery | **inherent** — Kafka covers committed output, not execution |
-| External side effects (the notification message stands in for an email) | **inherent** — a transaction cannot un-send |
-| `POST /orders` retried by the client still produces a second event | unclaimed; needs an idempotency key or an outbox |
-| The retry worker's republish and commit are still two operations | open by design; a second transactional producer adds surface, not insight |
-| An abort pays a full restore for every partition it touched | inherent to holding state outside the transaction |
-| `read_committed` stalls readers at the last stable offset while a transaction is open | inherent; the commit interval is the lever |
+[MIT](LICENSE) — use it, fork it, teach from it.

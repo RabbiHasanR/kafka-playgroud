@@ -104,4 +104,5 @@ seems risky enough to want isolation, say so and ask.
 ## Infrastructure
 
 The broker is defined in `docker-compose.yml` (single-node KRaft, Kafka 4.3.1).
-CLI reference lives in `README.md`. Feature code must not redefine broker config.
+CLI reference lives in `docs/kafka-cli.md`; per-spec walkthroughs in
+`docs/walkthroughs.md`. Feature code must not redefine broker config.
