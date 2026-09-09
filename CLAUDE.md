@@ -72,19 +72,31 @@ quietly keeping it.
 
 ## Testing
 
-**This project has no test suite. Do not write tests, and do not add one.** No
-`tests/` directory, no pytest.
+This project uses **test-driven development going forward**, starting with the next
+new spec. Specs `000`–`008` remain untested — do not retrofit tests onto already-shipped
+code; that is scope creep no requirement asked for.
 
-**`tasks.md` contains implementation steps only.** No test tasks, and no
-verification-experiment tasks either. Every numbered task must be a change to code,
-config, or docs that a requirement asked for — nothing whose deliverable is "run it
-and observe".
+**Test types:**
+- **Unit tests** — the default. Mock/fake the Kafka client; fast, no broker required.
+- **Integration tests** — only when a requirement can't be verified without the real
+  broker (e.g. actual delivery semantics, partition assignment). Keep these few.
 
-Verification is manual and mine. After a feature's tasks are done, I run it against
-the real broker myself and judge whether it behaves. Do not run experiments, invent
-experiment numbers, or record observed results in the spec unless I explicitly ask.
-If you think something needs checking, say so in your response — don't turn it into
-a task.
+**Where tests live:** `tests/unit/`, `tests/integration/`, mirroring the `specs/<NNN>-*`
+structure they cover. Use `pytest`.
+
+**In `tasks.md`:** each implementation task that has observable behavior gets a
+paired test task immediately before it, both citing the same requirement ID:
+
+```
+- [ ] T3a. Write test for R009.2 (producer retries on transient error)
+- [ ] T3b. Implement R009.2
+```
+
+Write the test first, watch it fail, then implement. Tick both boxes only once the
+test passes against the implementation.
+
+Manual verification against the real broker (the prior workflow) still happens after
+a feature's tasks are done — TDD's inner loop doesn't replace that outer check.
 
 Existing specs (`001`, `002`) carry experiment sections from the earlier convention.
 Leave them as historical record; don't extend them.
