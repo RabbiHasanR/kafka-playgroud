@@ -20,5 +20,11 @@ dependencies = [
     "rocksdict>=0.3.29",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
