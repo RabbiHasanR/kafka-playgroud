@@ -4,6 +4,7 @@ import pytest
 
 from order_service.events import (
     EventType,
+    LifecycleEvent,
     OrderCreatedPayload,
     OrderState,
     is_legal_transition,
@@ -81,3 +82,65 @@ class TestValidatePayload:
             EventType.SHIPPED, {"carrier": "DHL", "tracking_number": "1Z1"}
         )
         assert result is not None
+
+
+class TestLifecycleEvent:
+    """The envelope validates its own payload shape and exposes typed accessors."""
+
+    def test_valid_order_created_event_constructs(self, make_item, make_payment) -> None:
+        payload = OrderCreatedPayload(
+            customer_id="cust-1",
+            items=[make_item()],
+            total_amount=100,
+            payment=make_payment(amount=100),
+        )
+        event = LifecycleEvent(
+            order_id="ord-1",
+            sequence=1,
+            event_type=EventType.ORDER_CREATED,
+            payload=payload.model_dump(),
+        )
+        assert event.order_id == "ord-1"
+
+    def test_payload_not_matching_event_type_is_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            LifecycleEvent(
+                order_id="ord-1",
+                sequence=1,
+                event_type=EventType.SHIPPED,
+                payload={"carrier": "DHL"},  # missing tracking_number
+            )
+
+    def test_as_order_created_returns_typed_payload(self, make_item, make_payment) -> None:
+        payload = OrderCreatedPayload(
+            customer_id="cust-1",
+            items=[make_item()],
+            total_amount=100,
+            payment=make_payment(amount=100),
+        )
+        event = LifecycleEvent(
+            order_id="ord-1",
+            sequence=1,
+            event_type=EventType.ORDER_CREATED,
+            payload=payload.model_dump(),
+        )
+        assert event.as_order_created().customer_id == "cust-1"
+
+    def test_as_order_created_rejects_wrong_event_type(self) -> None:
+        event = LifecycleEvent(order_id="ord-1", sequence=2, event_type=EventType.PACKED)
+        with pytest.raises(ValueError, match="is not ORDER_CREATED"):
+            event.as_order_created()
+
+    def test_as_shipped_returns_typed_payload(self) -> None:
+        event = LifecycleEvent(
+            order_id="ord-1",
+            sequence=3,
+            event_type=EventType.SHIPPED,
+            payload={"carrier": "DHL", "tracking_number": "1Z1"},
+        )
+        assert event.as_shipped().carrier == "DHL"
+
+    def test_as_shipped_rejects_wrong_event_type(self) -> None:
+        event = LifecycleEvent(order_id="ord-1", sequence=2, event_type=EventType.PACKED)
+        with pytest.raises(ValueError, match="is not SHIPPED"):
+            event.as_shipped()
