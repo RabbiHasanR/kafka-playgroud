@@ -21,10 +21,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    # Needed by fastapi.testclient.TestClient, used by the integration suite to drive
+    # the real order-service app against a live broker.
+    "httpx2>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a live Kafka broker (docker compose up -d)",
+]
