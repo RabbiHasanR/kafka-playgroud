@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
+    "pytest>=9.1.1",
     # Needed by fastapi.testclient.TestClient, used by the integration suite to drive
     # the real order-service app against a live broker.
     "httpx2>=2.0",
