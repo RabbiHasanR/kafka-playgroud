@@ -109,8 +109,6 @@ class LifecycleEventProducer:
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
 
-    # -- lifecycle -------------------------------------------------------------
-
     def start(self) -> None:
         """Start the background thread that services delivery callbacks (D6)."""
         if self._poll_thread is not None:
@@ -160,8 +158,6 @@ class LifecycleEventProducer:
         """Serve delivery callbacks until stopped."""
         while not self._poll_stop.is_set():
             self._producer.poll(0.1)
-
-    # -- publishing ------------------------------------------------------------
 
     def publish_and_wait(
         self, event: LifecycleEvent, *, timeout: float | None = None

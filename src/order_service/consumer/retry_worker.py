@@ -162,8 +162,6 @@ class RetryWorker:
             self._consumer.close()
             logger.info("[retry-worker] consumer closed")
 
-    # -- the due-time gate (D4) ------------------------------------------------------
-
     def _resume_due(self) -> None:
         """Resume every partition whose head message has become due."""
         now = utc_now()
@@ -214,8 +212,6 @@ class RetryWorker:
         """Forget deferrals for partitions this member no longer owns."""
         for tp in partitions:
             self._deferred.pop((tp.topic, tp.partition), None)
-
-    # -- processing ------------------------------------------------------------------
 
     def _handle_error(self, message: Message) -> None:
         """Log a broker-reported error, raising only on a fatal one.

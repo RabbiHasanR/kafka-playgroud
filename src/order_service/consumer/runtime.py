@@ -110,7 +110,6 @@ def validate_protocol_settings(settings: Settings) -> None:
     """
     protocol = settings.consumer_group_protocol
 
-    # Each entry pairs the offending value with the remedy for that setting.
     if protocol is GroupProtocol.CONSUMER:
         incompatible = {
             "CONSUMER_ASSIGNMENT_STRATEGY": (
@@ -286,7 +285,6 @@ def apply_event(
     fold = current if current is not None else OrderFold(order_id=event.order_id)
     violations: list[Violation] = []
 
-    # -- sequence contiguity (R1.38) -------------------------------------------
     # An unseen order has last_sequence 0, so anything but 1 is a gap.
     expected_sequence = fold.last_sequence + 1
     if event.sequence != expected_sequence:
@@ -300,7 +298,6 @@ def apply_event(
             )
         )
 
-    # -- lifecycle legality (R1.39) --------------------------------------------
     if not is_legal_transition(event.event_type, fold.state):
         expected_event = EXPECTED_NEXT_EVENT.get(fold.state)
         violations.append(
@@ -514,7 +511,6 @@ class ServiceConsumer:
             self._consumer.close()
             logger.info("[%s] consumer closed", self._spec.name)
 
-    # -- rebalance callbacks (D5) ---------------------------------------------------
     # WARNING, not INFO: R2.9 wants these to stand out from per-record lines.
 
     def _on_assign(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:

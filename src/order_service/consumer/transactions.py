@@ -356,8 +356,6 @@ class TransactionalCommitter:
         """
         self.abort("shutdown")
 
-    # -- internals ------------------------------------------------------------------
-
     def _begin_if_needed(self) -> None:
         """Open a transaction if none is open.
 

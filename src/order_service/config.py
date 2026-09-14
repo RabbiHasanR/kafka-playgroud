@@ -268,13 +268,11 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9092,localhost:9094,localhost:9095"
     order_lifecycle_topic: str = "order-lifecycle"
 
-    # -- spec 006: the compacted table beside the event log ---------------------
     order_snapshot_topic: str = "order-snapshot"
 
     service_name: str = "inventory"
     consumer_group_id: str | None = None
 
-    # -- spec 002: membership, protocol, and the levers -------------------------
     consumer_instance_id: str | None = None
     consumer_group_protocol: GroupProtocol = GroupProtocol.CLASSIC
     consumer_assignment_strategy: str | None = None
@@ -284,20 +282,16 @@ class Settings(BaseSettings):
     handler_delay_seconds: float = 0.0
     consumer_instance_id_static: str | None = None
 
-    # -- spec 003: durable consumer state, and the two levers -------------------
     state_backend: StateBackend = StateBackend.MEMORY
     state_write_order: StateWriteOrder = StateWriteOrder.STATE_FIRST
     state_crash_after: StateCrashPoint = StateCrashPoint.NONE
 
-    # -- spec 007: the local store and its changelog ----------------------------
     state_dir: str = "/var/lib/order-state"
     state_changelog_prefix: str = "order-fold"
     state_rebuild: StateRebuild = StateRebuild.FULL
 
-    # -- spec 004: the producer's half of the durability contract ---------------
     producer_acks: ProducerAcks = ProducerAcks.ALL
 
-    # -- spec 005: retries, the dead-letter topic, and the failure lever --------
     retry_topic: str = "order-lifecycle.retry"
     dlq_topic: str = "order-lifecycle.dlq"
     retry_max_attempts: int = 3
@@ -311,7 +305,6 @@ class Settings(BaseSettings):
     handler_failure_orders: str | None = None
     handler_failure_attempts: int = 2
 
-    # -- spec 008: idempotence, transactions, and exactly-once ------------------
     processing_guarantee: ProcessingGuarantee = ProcessingGuarantee.AT_LEAST_ONCE
     producer_idempotence: bool = True
     consumer_isolation_level: IsolationLevel = IsolationLevel.READ_COMMITTED

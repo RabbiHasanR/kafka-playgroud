@@ -385,8 +385,6 @@ class LocalStateStore:
         """Return the topic this store's mutations are written to."""
         return self._topic
 
-    # -- reads and writes -----------------------------------------------------------
-
     def load(self, partition: int, order_id: str) -> OrderFold | None:
         """Return the fold for one order from the local store.
 
@@ -486,8 +484,6 @@ class LocalStateStore:
                 f"{remaining} changelog record(s) unacknowledged after {timeout:.0f}s — "
                 f"refusing to commit past state that cannot be rebuilt"
             )
-
-    # -- rebuilding -----------------------------------------------------------------
 
     def restore(self, partitions: Iterable[int]) -> None:
         """Rebuild each partition's store from its changelog partition (R7.7, R7.8).
@@ -683,8 +679,6 @@ class LocalStateStore:
             }
         )
 
-    # -- lifecycle ------------------------------------------------------------------
-
     def forget(self, partitions: Iterable[int]) -> None:
         """Release exactly these partitions, destroying nothing (R3.9, R7.10).
 
@@ -756,8 +750,6 @@ class LocalStateStore:
         also writes the failure router through it (008 D1).
         """
         self.forget(list(self._stores))
-
-    # -- internals ------------------------------------------------------------------
 
     def _store_for(self, partition: int) -> Rdict:
         """Open, or return, the store for one partition.
