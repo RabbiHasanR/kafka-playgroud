@@ -33,6 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "integration: requires a live Kafka broker (docker compose up -d)",
 ]
